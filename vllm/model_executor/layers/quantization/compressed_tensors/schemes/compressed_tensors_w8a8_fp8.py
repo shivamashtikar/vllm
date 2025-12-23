@@ -61,7 +61,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             )
 
         self.cutlass_block_fp8_supported = cutlass_block_fp8_supported()
-        self.use_aiter_and_is_supported = rocm_aiter_ops.is_linear_fp8_enaled()
+        self.use_aiter_and_is_supported = rocm_aiter_ops.is_linear_fp8_enabled()
 
         if self.weight_block_size is not None:
             assert not self.is_static_input_scheme
@@ -173,7 +173,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             layer.input_scale = None
 
         if self.strategy == QuantizationStrategy.BLOCK:
-            maybe_post_process_fp8_weight_block(layer, self.cutlass_block_fp8_supported)
+            maybe_post_process_fp8_weight_block(layer)
 
     def apply_weights(
         self,
