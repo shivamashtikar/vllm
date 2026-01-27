@@ -61,6 +61,17 @@ class KimiK2ToolParser(ToolParser):
         self.tool_call_start_token: str = "<|tool_call_begin|>"
         self.tool_call_end_token: str = "<|tool_call_end|>"
 
+        # All markers that should be stripped from content
+        self.all_tool_markers: list[str] = [
+            "<|tool_calls_section_begin|>",
+            "<|tool_calls_section_end|>",
+            "<|tool_call_section_begin|>",
+            "<|tool_call_section_end|>",
+            "<|tool_call_begin|>",
+            "<|tool_call_end|>",
+            "<|tool_call_argument_begin|>",
+        ]
+
         self.tool_call_regex = re.compile(
             r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^<]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>(?:(?!<\|tool_call_begin\|>).)*?)\s*<\|tool_call_end\|>",
             re.DOTALL,
@@ -125,6 +136,16 @@ class KimiK2ToolParser(ToolParser):
                 cleaned = cleaned.replace(variant, "")
                 found_end = True
         return cleaned, found_begin, found_end
+
+    def _strip_all_tool_markers(self, text: str) -> str:
+        """
+        Strip ALL tool-related markers from text.
+        This prevents any marker from leaking into content.
+        """
+        cleaned = text
+        for marker in self.all_tool_markers:
+            cleaned = cleaned.replace(marker, "")
+        return cleaned
 
     def _reset_section_state(self) -> None:
         """Reset state when exiting tool section."""
@@ -266,7 +287,8 @@ class KimiK2ToolParser(ToolParser):
                         break
                 if post_section_content.strip():
                     return DeltaMessage(content=post_section_content)
-                return DeltaMessage(content="")
+                # Return None to skip empty chunks (avoids "(no content)" in clients)
+                return None
         else:
             self.token_buffer = buffered_text
 
@@ -300,8 +322,10 @@ class KimiK2ToolParser(ToolParser):
                 )
                 self._reset_section_state()
                 # Deferred exit already handled by forced exit above
-                # Return remaining content as reasoning (or empty delta if no content)
-                return DeltaMessage(content=delta_text if delta_text.strip() else "")
+                # Strip all markers before returning as content
+                cleaned_text = self._strip_all_tool_markers(delta_text)
+                # Return remaining content as reasoning, or None for empty content
+                return DeltaMessage(content=cleaned_text) if cleaned_text.strip() else None
 
         try:
             # figure out where we are in the parsing by counting tool call
@@ -331,8 +355,8 @@ class KimiK2ToolParser(ToolParser):
                         "In tool section before first tool, suppressing: %s",
                         delta_text,
                     )
-                    # Return empty delta to maintain iterator contract
-                    return DeltaMessage(content="")
+                    # Return None to skip this chunk (avoids "(no content)" in clients)
+                    return None
                 logger.debug("Generating text content! skipping tool parsing.")
                 return DeltaMessage(content=delta_text)
 
@@ -382,8 +406,12 @@ class KimiK2ToolParser(ToolParser):
                 cur_tool_start_count == cur_tool_end_count
                 and cur_tool_end_count >= prev_tool_end_count
             ):
-                if self.prev_tool_call_arr is None or len(self.prev_tool_call_arr) == 0:
-                    logger.debug("attempting to close tool call, but no tool call")
+                if (self.prev_tool_call_arr is None
+                    or len(self.prev_tool_call_arr) == 0
+                    or self.current_tool_id >= len(self.prev_tool_call_arr)):
+                    logger.debug(
+                        "attempting to close tool call, but no tool call or invalid index"
+                    )
                     # Handle deferred section exit before returning
                     if deferred_section_exit and self.in_tool_section:
                         self._reset_section_state()
@@ -431,10 +459,16 @@ class KimiK2ToolParser(ToolParser):
                     # Handle deferred section exit before returning
                     if deferred_section_exit:
                         self._reset_section_state()
-                    return DeltaMessage(content="")
-                text = delta_text.replace(self.tool_call_start_token, "")
-                text = text.replace(self.tool_call_end_token, "")
-                delta = DeltaMessage(tool_calls=[], content=text)
+                    # Return None to skip this chunk (avoids "(no content)" in clients)
+                    return None
+                # Strip ALL tool markers, not just start/end
+                text = self._strip_all_tool_markers(delta_text)
+                # Skip empty content after stripping
+                if not text.strip():
+                    if deferred_section_exit and self.in_tool_section:
+                        self._reset_section_state()
+                    return None
+                delta = DeltaMessage(content=text)
                 # Handle deferred section exit before returning
                 if deferred_section_exit and self.in_tool_section:
                     self._reset_section_state()
@@ -583,7 +617,7 @@ class KimiK2ToolParser(ToolParser):
 
             # handle saving the state for the current tool into
             # the "prev" list for use in diffing for the next iteration
-            if self.current_tool_id == len(self.prev_tool_call_arr) - 1:
+            if self.current_tool_id < len(self.prev_tool_call_arr):
                 self.prev_tool_call_arr[self.current_tool_id] = current_tool_call
             else:
                 self.prev_tool_call_arr.append(current_tool_call)
@@ -597,4 +631,7 @@ class KimiK2ToolParser(ToolParser):
 
         except Exception:
             logger.exception("Error trying to handle streaming tool call.")
+            # Handle deferred section exit before returning
+            if deferred_section_exit and self.in_tool_section:
+                self._reset_section_state()
             return None  # do not stream a delta. skip this token ID.
