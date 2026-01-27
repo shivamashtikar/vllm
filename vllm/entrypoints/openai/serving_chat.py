@@ -146,6 +146,11 @@ class OpenAIServingChat(OpenAIServing):
             self.tool_call_id_type = "kimi_k2"
         else:
             self.tool_call_id_type = "random"
+        logger.info(
+            "Tool call ID type set to '%s' (model_type=%s)",
+            self.tool_call_id_type,
+            self.model_config.hf_config.model_type,
+        )
 
         self.use_harmony = self.model_config.hf_config.model_type == "gpt_oss"
         if self.use_harmony:
