@@ -188,7 +188,7 @@ class KimiK2ToolParser(ToolParser):
                 return ExtractedToolCallInformation(
                     tools_called=True,
                     tool_calls=tool_calls,
-                    content=content if content else None,
+                    content=content if content else "",
                 )
 
             except Exception:
