@@ -157,6 +157,20 @@ class KimiK2ToolParser(ToolParser):
         cleaned = self.thinking_pattern.sub("", cleaned)
         return cleaned
 
+    def _clean_content(self, text: str) -> str | None:
+        """
+        Clean content before returning to client.
+        Strips "(no content)" placeholder and returns None if empty.
+        """
+        if text is None:
+            return None
+        # Strip "(no content)" placeholder that model sometimes generates
+        cleaned = text.replace("(no content)", "")
+        # Return None if content is empty after cleaning
+        if not cleaned.strip():
+            return None
+        return cleaned
+
     def _reset_section_state(self) -> None:
         """Reset state when exiting tool section."""
         self.in_tool_section = False
@@ -283,12 +297,13 @@ class KimiK2ToolParser(ToolParser):
                     break
 
             if content_before_marker and content_before_marker.strip():
-                logger.debug(
-                    "Returning content before tool section: '%s'",
-                    content_before_marker[:50] if len(content_before_marker) > 50
-                    else content_before_marker
-                )
-                return DeltaMessage(content=content_before_marker)
+                cleaned = self._clean_content(content_before_marker)
+                if cleaned:
+                    logger.debug(
+                        "Returning content before tool section: '%s'",
+                        cleaned[:50] if len(cleaned) > 50 else cleaned
+                    )
+                    return DeltaMessage(content=cleaned)
             # If no content before marker, continue to process tool calls
             # but don't return content from this delta
             return None
@@ -317,8 +332,9 @@ class KimiK2ToolParser(ToolParser):
                         if len(parts) > 1:
                             post_section_content = parts[1]
                         break
-                if post_section_content.strip():
-                    return DeltaMessage(content=post_section_content)
+                cleaned = self._clean_content(post_section_content)
+                if cleaned:
+                    return DeltaMessage(content=cleaned)
                 # Return None to skip empty chunks (avoids "(no content)" in clients)
                 return None
         else:
@@ -334,7 +350,8 @@ class KimiK2ToolParser(ToolParser):
             logger.debug("No tool call tokens found!")
             # Don't clear buffer - it needs to accumulate partial markers across deltas
             # Buffer overflow is already protected by lines 215-224
-            return DeltaMessage(content=delta_text)
+            cleaned = self._clean_content(delta_text)
+            return DeltaMessage(content=cleaned) if cleaned else None
 
         # Strip section markers from delta_text for subsequent processing
         # NOTE: This preprocessing happens BEFORE the regex-based tool call
@@ -356,8 +373,9 @@ class KimiK2ToolParser(ToolParser):
                 # Deferred exit already handled by forced exit above
                 # Strip all markers before returning as content
                 cleaned_text = self._strip_all_tool_markers(delta_text)
+                cleaned_text = self._clean_content(cleaned_text)
                 # Return remaining content as reasoning, or None for empty content
-                return DeltaMessage(content=cleaned_text) if cleaned_text.strip() else None
+                return DeltaMessage(content=cleaned_text) if cleaned_text else None
 
         try:
             # figure out where we are in the parsing by counting tool call
@@ -390,7 +408,8 @@ class KimiK2ToolParser(ToolParser):
                     # Return None to skip this chunk (avoids "(no content)" in clients)
                     return None
                 logger.debug("Generating text content! skipping tool parsing.")
-                return DeltaMessage(content=delta_text)
+                cleaned = self._clean_content(delta_text)
+                return DeltaMessage(content=cleaned) if cleaned else None
 
             if self.tool_call_end_token in delta_text:
                 logger.debug("tool_call_end_token in delta_text")
@@ -495,8 +514,9 @@ class KimiK2ToolParser(ToolParser):
                     return None
                 # Strip ALL tool markers, not just start/end
                 text = self._strip_all_tool_markers(delta_text)
-                # Skip empty content after stripping
-                if not text.strip():
+                # Clean and skip empty content after stripping
+                text = self._clean_content(text)
+                if not text:
                     if deferred_section_exit and self.in_tool_section:
                         self._reset_section_state()
                     return None
@@ -574,11 +594,11 @@ class KimiK2ToolParser(ToolParser):
                 # CRITICAL: Never return content if we're in a tool section
                 if self.in_tool_section:
                     return None
-                delta = (
-                    DeltaMessage(content=delta_text)
-                    if text_portion is not None
-                    else None
-                )
+                if text_portion is not None:
+                    cleaned = self._clean_content(delta_text)
+                    delta = DeltaMessage(content=cleaned) if cleaned else None
+                else:
+                    delta = None
                 return delta
 
             # now, the nitty-gritty of tool calls
