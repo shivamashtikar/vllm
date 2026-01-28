@@ -200,8 +200,10 @@ class KimiK2ToolParser(ToolParser):
     ) -> ExtractedToolCallInformation:
         # sanity check; avoid unnecessary processing
         if self.tool_calls_start_token not in model_output:
+            # Filter "(no content)" from non-tool responses
+            cleaned_output = self._clean_content(model_output) or ""
             return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=[], content=model_output
+                tools_called=False, tool_calls=[], content=cleaned_output
             )
 
         else:
@@ -230,16 +232,20 @@ class KimiK2ToolParser(ToolParser):
                     )
 
                 content = model_output[: model_output.find(self.tool_calls_start_token)]
+                # Filter "(no content)" from tool call responses
+                cleaned_content = self._clean_content(content) or ""
                 return ExtractedToolCallInformation(
                     tools_called=True,
                     tool_calls=tool_calls,
-                    content=content if content else "",
+                    content=cleaned_content,
                 )
 
             except Exception:
                 logger.exception("Error in extracting tool call from response.")
+                # Filter "(no content)" from error fallback
+                cleaned_output = self._clean_content(model_output) or ""
                 return ExtractedToolCallInformation(
-                    tools_called=False, tool_calls=[], content=model_output
+                    tools_called=False, tool_calls=[], content=cleaned_output
                 )
 
     def extract_tool_calls_streaming(
