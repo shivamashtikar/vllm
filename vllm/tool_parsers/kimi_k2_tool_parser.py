@@ -39,9 +39,9 @@ class KimiK2ToolParser(ToolParser):
         # Section-level state management to prevent token leakage
         self.in_tool_section: bool = False
         self.token_buffer: str = ""
-        # Buffer size: empirical worst-case for longest marker (~30 chars) * 2
-        # + safety margin for unicode + partial overlap. Prevents unbounded growth.
-        self.buffer_max_size: int = 1024
+        # Buffer size: increased to handle large tool call arguments (file paths,
+        # nested JSON). 4096 bytes provides headroom for most practical cases.
+        self.buffer_max_size: int = 4096
         self.section_char_count: int = 0  # Track characters processed in tool section
         self.max_section_chars: int = 8192  # Force exit if section exceeds this
         self._buffer_overflow_logged: bool = False  # Log overflow once per session
@@ -62,6 +62,7 @@ class KimiK2ToolParser(ToolParser):
         self.tool_call_end_token: str = "<|tool_call_end|>"
 
         # All markers that should be stripped from content
+        # Includes tool markers and thinking markers that may leak
         self.all_tool_markers: list[str] = [
             "<|tool_calls_section_begin|>",
             "<|tool_calls_section_end|>",
@@ -71,6 +72,13 @@ class KimiK2ToolParser(ToolParser):
             "<|tool_call_end|>",
             "<|tool_call_argument_begin|>",
         ]
+
+        # Regex pattern to strip thinking blocks: <think>...</think>
+        # This handles both complete thinking blocks and partial markers
+        self.thinking_pattern = re.compile(
+            r"<think>.*?</think>|<think>|</think>",
+            re.DOTALL
+        )
 
         self.tool_call_regex = re.compile(
             r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^<]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>(?:(?!<\|tool_call_begin\|>).)*?)\s*<\|tool_call_end\|>",
@@ -139,12 +147,14 @@ class KimiK2ToolParser(ToolParser):
 
     def _strip_all_tool_markers(self, text: str) -> str:
         """
-        Strip ALL tool-related markers from text.
+        Strip ALL tool-related markers and thinking blocks from text.
         This prevents any marker from leaking into content.
         """
         cleaned = text
         for marker in self.all_tool_markers:
             cleaned = cleaned.replace(marker, "")
+        # Also strip thinking blocks that may leak into content
+        cleaned = self.thinking_pattern.sub("", cleaned)
         return cleaned
 
     def _reset_section_state(self) -> None:
@@ -260,6 +270,28 @@ class KimiK2ToolParser(ToolParser):
             self.in_tool_section = True
             self.token_buffer = buffered_text  # Use cleaned buffer
             self.section_char_count = 0  # Reset counter for new section
+
+            # CRITICAL: Extract content that appeared BEFORE the section marker
+            # and return it as reasoning content. This prevents content from
+            # leaking into the tool call stream.
+            content_before_marker = None
+            for variant in self.tool_calls_start_token_variants:
+                if variant in delta_text:
+                    marker_pos = delta_text.find(variant)
+                    if marker_pos > 0:
+                        content_before_marker = delta_text[:marker_pos]
+                    break
+
+            if content_before_marker and content_before_marker.strip():
+                logger.debug(
+                    "Returning content before tool section: '%s'",
+                    content_before_marker[:50] if len(content_before_marker) > 50
+                    else content_before_marker
+                )
+                return DeltaMessage(content=content_before_marker)
+            # If no content before marker, continue to process tool calls
+            # but don't return content from this delta
+            return None
 
         if found_section_end and self.in_tool_section:
             logger.debug("Detected section end marker")
@@ -476,6 +508,8 @@ class KimiK2ToolParser(ToolParser):
 
             current_tool_call = dict()
             if tool_call_portion:
+                # Strip leading/trailing whitespace to fix regex matching
+                tool_call_portion = tool_call_portion.strip()
                 current_tool_call_matches = self.stream_tool_call_portion_regex.match(
                     tool_call_portion
                 )
@@ -508,6 +542,14 @@ class KimiK2ToolParser(ToolParser):
                 tool_id = current_tool_call.get("id")
                 if function_name:
                     self.current_tool_name_sent = True
+
+                    # CRITICAL: Initialize prev_tool_call_arr before returning
+                    # This prevents IndexError on subsequent iterations
+                    if len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append(current_tool_call)
+                    else:
+                        self.prev_tool_call_arr[self.current_tool_id] = current_tool_call
+
                     return DeltaMessage(
                         tool_calls=[
                             DeltaToolCall(
