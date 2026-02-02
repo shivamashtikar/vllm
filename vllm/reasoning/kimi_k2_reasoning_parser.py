@@ -160,5 +160,5 @@ class KimiK2ReasoningParser(ReasoningParser):
         return DeltaMessage(
             content=cleaned_content,
             reasoning=cleaned_reasoning,
-            tool_calls=result.tool_calls if result.tool_calls else None,
+            tool_calls=result.tool_calls if result.tool_calls else [],
         )
