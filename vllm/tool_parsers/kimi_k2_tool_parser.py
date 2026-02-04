@@ -4,6 +4,8 @@
 
 from collections.abc import Sequence
 
+import json
+
 import regex as re
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -71,6 +73,15 @@ class KimiK2ToolParser(ToolParser):
         )
 
         self.stream_tool_call_name_regex = re.compile(r"(?P<tool_call_id>.+:\d+)\s*")
+
+        # Fallback regex for raw tool call format without special tokens
+        # Matches: functions.name:id{...} or name:id{...}
+        # This handles cases where model outputs raw tool calls
+        self.raw_tool_call_regex = re.compile(
+            r"(?:functions\.)?(?P<function_name>[\w_]+):(?P<tool_index>\d+)"
+            r"\s*(?P<function_arguments>\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})",
+            re.DOTALL,
+        )
 
         if not self.model_tokenizer:
             raise ValueError(
@@ -148,18 +159,150 @@ class KimiK2ToolParser(ToolParser):
 
         logger.debug("Streaming state reset")
 
+    def _extract_raw_tool_calls(
+        self, model_output: str
+    ) -> ExtractedToolCallInformation:
+        """
+        Fallback extraction for raw tool call format without special tokens.
+        Handles format like: functions.name:id{...} or name:id{...}
+        """
+        try:
+            matches = list(self.raw_tool_call_regex.finditer(model_output))
+            if not matches:
+                return ExtractedToolCallInformation(
+                    tools_called=False, tool_calls=[], content=model_output
+                )
+
+            tool_calls = []
+            first_match_start = matches[0].start()
+
+            for match in matches:
+                function_name = match.group("function_name")
+                tool_index = match.group("tool_index")
+                function_args = match.group("function_arguments").strip()
+
+                # Validate JSON
+                try:
+                    json.loads(function_args)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Invalid JSON in raw tool call arguments: %s", function_args
+                    )
+                    continue
+
+                tool_id = f"functions.{function_name}:{tool_index}"
+                tool_calls.append(
+                    ToolCall(
+                        id=tool_id,
+                        type="function",
+                        function=FunctionCall(
+                            name=function_name, arguments=function_args
+                        ),
+                    )
+                )
+
+            if tool_calls:
+                content = model_output[:first_match_start].strip() or None
+                logger.debug(
+                    "Extracted %d tool calls using raw format fallback",
+                    len(tool_calls),
+                )
+                return ExtractedToolCallInformation(
+                    tools_called=True,
+                    tool_calls=tool_calls,
+                    content=content,
+                )
+
+            return ExtractedToolCallInformation(
+                tools_called=False, tool_calls=[], content=model_output
+            )
+        except Exception:
+            logger.exception("Error in extracting raw tool calls.")
+            return ExtractedToolCallInformation(
+                tools_called=False, tool_calls=[], content=model_output
+            )
+
+    def _extract_raw_tool_calls_streaming(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+    ) -> DeltaMessage | None:
+        """
+        Handle streaming extraction for raw tool call format.
+        This is used when model outputs tool calls without special tokens.
+        """
+        try:
+            # Check if we have a complete tool call in the buffer
+            match = self.raw_tool_call_regex.search(self.token_buffer)
+            if not match:
+                # No complete tool call yet, suppress output
+                return DeltaMessage(content="")
+
+            function_name = match.group("function_name")
+            tool_index = match.group("tool_index")
+            function_args = match.group("function_arguments").strip()
+
+            # Validate JSON is complete
+            try:
+                json.loads(function_args)
+            except json.JSONDecodeError:
+                # JSON not complete yet, wait for more tokens
+                return None
+
+            # We have a complete tool call
+            tool_id = f"functions.{function_name}:{tool_index}"
+
+            # Check if this is a new tool call or continuation
+            if not self.current_tool_name_sent:
+                self.current_tool_id += 1
+                self.current_tool_name_sent = True
+                self.streamed_args_for_tool.append("")
+
+                # Emit the tool name first
+                return DeltaMessage(
+                    tool_calls=[
+                        DeltaToolCall(
+                            index=self.current_tool_id,
+                            type="function",
+                            id=tool_id,
+                            function=DeltaFunctionCall(
+                                name=function_name
+                            ).model_dump(exclude_none=True),
+                        )
+                    ]
+                )
+
+            # Check if we need to send arguments
+            prev_args = self.streamed_args_for_tool[self.current_tool_id]
+            if function_args != prev_args and function_args.startswith(prev_args):
+                delta_args = function_args[len(prev_args):]
+                self.streamed_args_for_tool[self.current_tool_id] = function_args
+
+                return DeltaMessage(
+                    tool_calls=[
+                        DeltaToolCall(
+                            index=self.current_tool_id,
+                            function=DeltaFunctionCall(
+                                arguments=delta_args
+                            ).model_dump(exclude_none=True),
+                        )
+                    ]
+                )
+
+            return None
+
+        except Exception:
+            logger.exception("Error in raw tool call streaming extraction.")
+            return None
+
     def extract_tool_calls(
         self,
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
-        # sanity check; avoid unnecessary processing
-        if self.tool_calls_start_token not in model_output:
-            return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=[], content=model_output
-            )
-
-        else:
+        # First, try to extract using special tokens (preferred format)
+        if self.tool_calls_start_token in model_output:
             try:
                 # there are two possible captures - between tags, or between a
                 # tag and end-of-string so the result of
@@ -193,9 +336,11 @@ class KimiK2ToolParser(ToolParser):
 
             except Exception:
                 logger.exception("Error in extracting tool call from response.")
-                return ExtractedToolCallInformation(
-                    tools_called=False, tool_calls=[], content=model_output
-                )
+                # Fall through to try raw format
+
+        # Fallback: try to extract raw format tool calls (functions.X:N{...})
+        # This handles cases where model outputs without special tokens
+        return self._extract_raw_tool_calls(model_output)
 
     def extract_tool_calls_streaming(
         self,
@@ -275,12 +420,31 @@ class KimiK2ToolParser(ToolParser):
             tid in current_token_ids for tid in self.tool_calls_start_token_ids
         )
 
-        # Early return: if no section token detected yet, return as reasoning content
-        if not has_section_token and not self.in_tool_section:
+        # Check for raw tool call pattern in buffer (fallback for models that
+        # don't use special tokens)
+        has_raw_tool_call = bool(self.raw_tool_call_regex.search(self.token_buffer))
+
+        # Early return: if no section token and no raw tool call detected yet,
+        # return as content
+        if not has_section_token and not self.in_tool_section and not has_raw_tool_call:
             logger.debug("No tool call tokens found!")
             # Don't clear buffer - it needs to accumulate partial markers across deltas
             # Buffer overflow is already protected by lines 215-224
             return DeltaMessage(content=delta_text)
+
+        # If we detected a raw tool call pattern but no special tokens,
+        # we need to handle it differently - extract the tool call from buffer
+        if has_raw_tool_call and not has_section_token and not self.in_tool_section:
+            logger.debug("Detected raw tool call pattern in buffer")
+            # For streaming with raw format, we'll collect in buffer and emit
+            # tool calls when we detect a complete JSON object
+            result = self._extract_raw_tool_calls_streaming(
+                previous_text, current_text, delta_text
+            )
+            if result is not None:
+                return result
+            # If extraction returned None, continue with normal flow
+            return None
 
         # Strip section markers from delta_text for subsequent processing
         # NOTE: This preprocessing happens BEFORE the regex-based tool call

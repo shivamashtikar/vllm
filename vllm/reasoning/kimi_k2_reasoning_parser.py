@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +35,9 @@ class KimiK2ReasoningParser(ReasoningParser):
 
     This parser also filters out "(no content)" placeholder text that the
     Kimi K2 model sometimes generates when making tool calls without text.
+
+    It additionally handles raw tool call patterns (functions.X:N{...}) that
+    may appear when the model outputs without special tokens.
     """
 
     # Tool markers that should be stripped from reasoning content
@@ -46,6 +50,13 @@ class KimiK2ReasoningParser(ReasoningParser):
         "<|tool_call_end|>",
         "<|tool_call_argument_begin|>",
     ]
+
+    # Pattern for raw tool calls without special tokens
+    # Matches: functions.name:id{ or name:id{ at the start of a tool call
+    RAW_TOOL_CALL_PATTERN = re.compile(
+        r"(?:functions\.)?[\w_]+:\d+\s*\{",
+        re.MULTILINE,
+    )
 
     def _clean_content(self, text: str | None) -> str | None:
         """
@@ -77,6 +88,12 @@ class KimiK2ReasoningParser(ReasoningParser):
                 marker_pos = cleaned.find(marker)
                 cleaned = cleaned[:marker_pos]
                 break
+
+        # Also check for raw tool call pattern (functions.X:N{...})
+        # and strip everything from there onwards
+        raw_match = self.RAW_TOOL_CALL_PATTERN.search(cleaned)
+        if raw_match:
+            cleaned = cleaned[: raw_match.start()]
 
         # Also strip "(no content)" placeholder
         cleaned = cleaned.replace("(no content)", "")
