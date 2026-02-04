@@ -86,8 +86,26 @@ class KimiK2ToolParser(ToolParser):
             r"(?:functions\.)?(?P<function_name>[\w_]+):(?P<tool_index>\d+)",
         )
 
+        # Patterns to detect early signs of a raw tool call (for early buffering)
+        # These detect partial prefixes that might become tool calls
+        self.raw_tool_call_prefixes = [
+            "functions.",
+            "functions",
+            "function",
+            "functio",
+            "functi",
+            "funct",
+            "func",
+        ]
+
+        # Regex to detect "functions.X" or "functions.X:" patterns (partial tool calls)
+        self.raw_tool_call_partial_regex = re.compile(
+            r"functions\.[\w_]+:?$|[\w_]+:$",
+        )
+
         # State for raw tool call parsing
         self.in_raw_tool_call: bool = False
+        self.potential_raw_tool_call: bool = False  # For early prefix detection
         self.raw_tool_call_buffer: str = ""
         self.raw_tool_call_name: str | None = None
         self.raw_tool_call_index: str | None = None
@@ -163,6 +181,7 @@ class KimiK2ToolParser(ToolParser):
 
         # Reset raw tool call state
         self.in_raw_tool_call = False
+        self.potential_raw_tool_call = False
         self.raw_tool_call_buffer = ""
         self.raw_tool_call_name = None
         self.raw_tool_call_index = None
@@ -319,6 +338,65 @@ class KimiK2ToolParser(ToolParser):
         Uses bracket counting to detect complete JSON objects.
         """
         try:
+            # If we're in potential mode (prefix detected), check if it's confirmed
+            if self.potential_raw_tool_call and not self.in_raw_tool_call:
+                # Check if we now have the full pattern
+                match = self.raw_tool_call_start_regex.search(self.token_buffer)
+                if match:
+                    # Confirmed! Transition to in_raw_tool_call
+                    self.potential_raw_tool_call = False
+                    self.in_raw_tool_call = True
+                    self.raw_tool_call_name = match.group("function_name")
+                    self.raw_tool_call_index = match.group("tool_index")
+                    json_start = match.end() - 1
+                    self.raw_tool_call_buffer = self.token_buffer[json_start:]
+                    self.raw_tool_brace_depth = 0
+
+                    # Count braces in what we have so far
+                    in_string = False
+                    escape_next = False
+                    for char in self.raw_tool_call_buffer:
+                        if escape_next:
+                            escape_next = False
+                            continue
+                        if char == "\\":
+                            escape_next = True
+                            continue
+                        if char == '"':
+                            in_string = not in_string
+                        elif not in_string:
+                            if char == "{":
+                                self.raw_tool_brace_depth += 1
+                            elif char == "}":
+                                self.raw_tool_brace_depth -= 1
+
+                    logger.debug(
+                        "Confirmed raw tool call: %s:%s, brace_depth=%d",
+                        self.raw_tool_call_name,
+                        self.raw_tool_call_index,
+                        self.raw_tool_brace_depth,
+                    )
+                    # Continue to process as in_raw_tool_call below
+                elif self.raw_tool_call_header_regex.search(self.token_buffer):
+                    # Still looks like it could be a tool call, keep waiting
+                    return DeltaMessage(content="")
+                elif self.raw_tool_call_partial_regex.search(self.token_buffer):
+                    # Partial pattern detected, keep waiting
+                    return DeltaMessage(content="")
+                else:
+                    # Check if we still have a prefix
+                    buffer_end = self.token_buffer[-20:] if len(self.token_buffer) > 20 else self.token_buffer
+                    has_prefix = any(buffer_end.endswith(p) for p in self.raw_tool_call_prefixes)
+                    if has_prefix:
+                        # Still have a prefix, keep waiting
+                        return DeltaMessage(content="")
+                    # The potential tool call didn't pan out
+                    # This shouldn't happen often, but release buffered content
+                    logger.debug("Potential raw tool call did not confirm, releasing buffer")
+                    self.potential_raw_tool_call = False
+                    # Return the delta as content since it's not a tool call
+                    return DeltaMessage(content=delta_text)
+
             # If we're not in a raw tool call, check if one is starting
             if not self.in_raw_tool_call:
                 match = self.raw_tool_call_start_regex.search(self.token_buffer)
@@ -590,14 +668,38 @@ class KimiK2ToolParser(ToolParser):
 
         # Check for raw tool call pattern in buffer (fallback for models that
         # don't use special tokens). Check for:
-        # 1. Complete raw tool call start pattern (functions.X:N{)
-        # 2. Partial pattern that could become a tool call (functions.X:N)
-        # 3. Already in raw tool call mode
-        has_raw_tool_call = (
-            self.in_raw_tool_call
-            or bool(self.raw_tool_call_start_regex.search(self.token_buffer))
-            or bool(self.raw_tool_call_header_regex.search(self.token_buffer))
-        )
+        # 1. Already in raw tool call mode
+        # 2. Complete raw tool call start pattern (functions.X:N{)
+        # 3. Partial pattern that could become a tool call (functions.X:N)
+        # 4. Early prefix that might become a tool call (functions. or Edit:)
+        has_raw_tool_call = self.in_raw_tool_call or self.potential_raw_tool_call
+
+        if not has_raw_tool_call:
+            # Check for complete or partial patterns
+            if self.raw_tool_call_start_regex.search(self.token_buffer):
+                has_raw_tool_call = True
+            elif self.raw_tool_call_header_regex.search(self.token_buffer):
+                has_raw_tool_call = True
+            elif self.raw_tool_call_partial_regex.search(self.token_buffer):
+                # Partial pattern like "functions.Edit" or "functions.Edit:"
+                self.potential_raw_tool_call = True
+                has_raw_tool_call = True
+                logger.debug(
+                    "Detected partial raw tool call pattern in buffer"
+                )
+            else:
+                # Check for early prefixes at end of buffer
+                buffer_end = self.token_buffer[-20:] if len(self.token_buffer) > 20 else self.token_buffer
+                for prefix in self.raw_tool_call_prefixes:
+                    if buffer_end.endswith(prefix):
+                        # Early prefix detected - start buffering
+                        self.potential_raw_tool_call = True
+                        has_raw_tool_call = True
+                        logger.debug(
+                            "Detected potential raw tool call prefix: %s",
+                            prefix,
+                        )
+                        break
 
         # Early return: if no section token and no raw tool call detected yet,
         # return as content
