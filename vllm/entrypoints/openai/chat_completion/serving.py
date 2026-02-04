@@ -921,14 +921,6 @@ class OpenAIServingChat(OpenAIServing):
                                     output.token_ids,
                                 )
                             )
-                            # Fallback: if delta has reasoning but no content,
-                            # copy reasoning to content
-                            if (
-                                delta_message
-                                and not delta_message.content
-                                and delta_message.reasoning
-                            ):
-                                delta_message.content = delta_message.reasoning
                             # When encountering think end id in delta_token_ids
                             # or think end id in prompt_token_ids
                             # i.e {"enable_thinking": False},
@@ -1015,14 +1007,6 @@ class OpenAIServingChat(OpenAIServing):
                                     output_token_ids,
                                 )
                             )
-                            # Fallback: if delta has reasoning but no content,
-                            # copy reasoning to content
-                            if (
-                                delta_message
-                                and not delta_message.content
-                                and delta_message.reasoning
-                            ):
-                                delta_message.content = delta_message.reasoning
                             if reasoning_parser.is_reasoning_end(output_token_ids):
                                 reasoning_end_arr[i] = True
                                 if delta_message and delta_message.content:
@@ -1085,14 +1069,6 @@ class OpenAIServingChat(OpenAIServing):
                                         output_token_ids,
                                     )
                                 )
-                                # Fallback: if delta has reasoning but no content,
-                                # copy reasoning to content
-                                if (
-                                    delta_message
-                                    and not delta_message.content
-                                    and delta_message.reasoning
-                                ):
-                                    delta_message.content = delta_message.reasoning
 
                                 # When encountering think end id in delta_token_ids,
                                 # set reasoning status to end.
@@ -1160,14 +1136,6 @@ class OpenAIServingChat(OpenAIServing):
                             current_token_ids,
                             output.token_ids,
                         )
-                        # Fallback: if delta has reasoning but no content,
-                        # copy reasoning to content
-                        if (
-                            delta_message
-                            and not delta_message.content
-                            and delta_message.reasoning
-                        ):
-                            delta_message.content = delta_message.reasoning
                     # handle streaming just a content delta
                     else:
                         delta_message = DeltaMessage(content=delta_text)
