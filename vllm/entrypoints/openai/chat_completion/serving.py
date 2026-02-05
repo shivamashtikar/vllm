@@ -679,8 +679,11 @@ class OpenAIServingChat(OpenAIServing):
             # For reasoning parser and tool call all enabled
             added_content_delta_arr = [False] * num_choices
             reasoning_end_arr = [False] * num_choices
+            # Buffer to accumulate reasoning content for delayed emission
+            reasoning_buffer: list[str] = [""] * num_choices
         else:
             all_previous_token_ids = None
+            reasoning_buffer = None
 
         try:
             if self.reasoning_parser:
@@ -921,6 +924,16 @@ class OpenAIServingChat(OpenAIServing):
                                     output.token_ids,
                                 )
                             )
+                            # Buffer reasoning content instead of emitting
+                            if (
+                                delta_message
+                                and delta_message.reasoning
+                                and not delta_message.content
+                                and reasoning_buffer is not None
+                                and not reasoning_end_arr[i]
+                            ):
+                                reasoning_buffer[i] += delta_message.reasoning
+                                delta_message = None
                             # When encountering think end id in delta_token_ids
                             # or think end id in prompt_token_ids
                             # i.e {"enable_thinking": False},
@@ -1007,6 +1020,15 @@ class OpenAIServingChat(OpenAIServing):
                                     output_token_ids,
                                 )
                             )
+                            # Buffer reasoning content instead of emitting
+                            if (
+                                delta_message
+                                and delta_message.reasoning
+                                and not delta_message.content
+                                and reasoning_buffer is not None
+                            ):
+                                reasoning_buffer[i] += delta_message.reasoning
+                                delta_message = None
                             if reasoning_parser.is_reasoning_end(output_token_ids):
                                 reasoning_end_arr[i] = True
                                 if delta_message and delta_message.content:
@@ -1069,6 +1091,15 @@ class OpenAIServingChat(OpenAIServing):
                                         output_token_ids,
                                     )
                                 )
+                                # Buffer reasoning content instead of emitting
+                                if (
+                                    delta_message
+                                    and delta_message.reasoning
+                                    and not delta_message.content
+                                    and reasoning_buffer is not None
+                                ):
+                                    reasoning_buffer[i] += delta_message.reasoning
+                                    delta_message = None
 
                                 # When encountering think end id in delta_token_ids,
                                 # set reasoning status to end.
@@ -1136,6 +1167,21 @@ class OpenAIServingChat(OpenAIServing):
                             current_token_ids,
                             output.token_ids,
                         )
+                        # Buffer reasoning content instead of emitting it.
+                        # Content will be emitted at stream end if </think>
+                        # is never seen.
+                        if (
+                            delta_message
+                            and delta_message.reasoning
+                            and not delta_message.content
+                            and reasoning_buffer is not None
+                            and not reasoning_end_arr[i]
+                        ):
+                            reasoning_buffer[i] += delta_message.reasoning
+                            delta_message = None  # Suppress emission
+                        elif delta_message and delta_message.content:
+                            # </think> was seen, mark reasoning as ended
+                            reasoning_end_arr[i] = True
                     # handle streaming just a content delta
                     else:
                         delta_message = DeltaMessage(content=delta_text)
@@ -1274,6 +1320,17 @@ class OpenAIServingChat(OpenAIServing):
                             delta_message = self._create_remaining_args_delta(
                                 delta_message, remaining_call, index
                             )
+
+                        # Emit buffered reasoning as content if </think> was
+                        # never seen
+                        if (
+                            self.reasoning_parser
+                            and reasoning_buffer is not None
+                            and reasoning_buffer[i]
+                            and not reasoning_end_arr[i]
+                        ):
+                            delta_message = DeltaMessage(content=reasoning_buffer[i])
+                            reasoning_buffer[i] = ""  # Clear buffer
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
@@ -1515,6 +1572,10 @@ class OpenAIServingChat(OpenAIServing):
                 reasoning, content = reasoning_parser.extract_reasoning(
                     output.text, request=request
                 )
+                # Fallback: if content is null but reasoning has content,
+                # use reasoning as content
+                if not content and reasoning:
+                    content = reasoning
                 if not request.include_reasoning:
                     reasoning = None
             else:

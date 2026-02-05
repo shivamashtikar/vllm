@@ -4,6 +4,8 @@
 
 from collections.abc import Sequence
 
+import json
+
 import regex as re
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -71,6 +73,43 @@ class KimiK2ToolParser(ToolParser):
         )
 
         self.stream_tool_call_name_regex = re.compile(r"(?P<tool_call_id>.+:\d+)\s*")
+
+        # Fallback regex for raw tool call format without special tokens
+        # Pattern to detect the START of a raw tool call (before JSON args)
+        # Matches: functions.name:id or name:id followed by optional whitespace and {
+        self.raw_tool_call_start_regex = re.compile(
+            r"(?:functions\.)?(?P<function_name>[\w_]+):(?P<tool_index>\d+)\s*\{",
+        )
+
+        # Pattern to extract function name and index from partial match
+        self.raw_tool_call_header_regex = re.compile(
+            r"(?:functions\.)?(?P<function_name>[\w_]+):(?P<tool_index>\d+)",
+        )
+
+        # Patterns to detect early signs of a raw tool call (for early buffering)
+        # These detect partial prefixes that might become tool calls
+        self.raw_tool_call_prefixes = [
+            "functions.",
+            "functions",
+            "function",
+            "functio",
+            "functi",
+            "funct",
+            "func",
+        ]
+
+        # Regex to detect "functions.X" or "functions.X:" patterns (partial tool calls)
+        self.raw_tool_call_partial_regex = re.compile(
+            r"functions\.[\w_]+:?$|[\w_]+:$",
+        )
+
+        # State for raw tool call parsing
+        self.in_raw_tool_call: bool = False
+        self.potential_raw_tool_call: bool = False  # For early prefix detection
+        self.raw_tool_call_buffer: str = ""
+        self.raw_tool_call_name: str | None = None
+        self.raw_tool_call_index: str | None = None
+        self.raw_tool_brace_depth: int = 0
 
         if not self.model_tokenizer:
             raise ValueError(
@@ -140,6 +179,14 @@ class KimiK2ToolParser(ToolParser):
         # Reset section state
         self._reset_section_state()
 
+        # Reset raw tool call state
+        self.in_raw_tool_call = False
+        self.potential_raw_tool_call = False
+        self.raw_tool_call_buffer = ""
+        self.raw_tool_call_name = None
+        self.raw_tool_call_index = None
+        self.raw_tool_brace_depth = 0
+
         # Reset parent class state
         self.current_tool_name_sent = False
         self.prev_tool_call_arr = []
@@ -148,18 +195,360 @@ class KimiK2ToolParser(ToolParser):
 
         logger.debug("Streaming state reset")
 
+    def _find_json_end(self, text: str, start_idx: int) -> int:
+        """
+        Find the end of a JSON object starting at start_idx.
+        Uses bracket counting that handles strings with escaped characters.
+        Returns the index after the closing brace, or -1 if not complete.
+        """
+        if start_idx >= len(text) or text[start_idx] != "{":
+            return -1
+
+        depth = 0
+        in_string = False
+        escape_next = False
+        i = start_idx
+
+        while i < len(text):
+            char = text[i]
+
+            if escape_next:
+                escape_next = False
+                i += 1
+                continue
+
+            if char == "\\":
+                escape_next = True
+                i += 1
+                continue
+
+            if char == '"' and not escape_next:
+                in_string = not in_string
+            elif not in_string:
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return i + 1  # Return index after closing brace
+
+            i += 1
+
+        return -1  # JSON not complete
+
+    def _extract_raw_tool_calls(
+        self, model_output: str
+    ) -> ExtractedToolCallInformation:
+        """
+        Fallback extraction for raw tool call format without special tokens.
+        Handles format like: functions.name:id{...} or name:id{...}
+        Uses proper JSON boundary detection for nested objects.
+        """
+        try:
+            tool_calls = []
+            first_match_start = -1
+            search_start = 0
+
+            while True:
+                # Find the start of a raw tool call
+                match = self.raw_tool_call_start_regex.search(
+                    model_output, pos=search_start
+                )
+                if not match:
+                    break
+
+                if first_match_start == -1:
+                    first_match_start = match.start()
+
+                function_name = match.group("function_name")
+                tool_index = match.group("tool_index")
+
+                # Find where the JSON starts (the { in the match)
+                json_start = match.end() - 1  # -1 because { is included in match
+
+                # Find the end of the JSON object
+                json_end = self._find_json_end(model_output, json_start)
+                if json_end == -1:
+                    # JSON not complete, skip this match
+                    logger.debug(
+                        "Raw tool call JSON not complete for %s:%s",
+                        function_name,
+                        tool_index,
+                    )
+                    search_start = match.end()
+                    continue
+
+                function_args = model_output[json_start:json_end]
+
+                # Validate JSON
+                try:
+                    json.loads(function_args)
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        "Invalid JSON in raw tool call arguments: %s (error: %s)",
+                        function_args[:100],
+                        str(e),
+                    )
+                    search_start = json_end
+                    continue
+
+                tool_id = f"functions.{function_name}:{tool_index}"
+                tool_calls.append(
+                    ToolCall(
+                        id=tool_id,
+                        type="function",
+                        function=FunctionCall(
+                            name=function_name, arguments=function_args
+                        ),
+                    )
+                )
+
+                search_start = json_end
+
+            if tool_calls:
+                content = model_output[:first_match_start].strip() or None
+                logger.debug(
+                    "Extracted %d tool calls using raw format fallback",
+                    len(tool_calls),
+                )
+                return ExtractedToolCallInformation(
+                    tools_called=True,
+                    tool_calls=tool_calls,
+                    content=content,
+                )
+
+            return ExtractedToolCallInformation(
+                tools_called=False, tool_calls=[], content=model_output
+            )
+        except Exception:
+            logger.exception("Error in extracting raw tool calls.")
+            return ExtractedToolCallInformation(
+                tools_called=False, tool_calls=[], content=model_output
+            )
+
+    def _extract_raw_tool_calls_streaming(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+    ) -> DeltaMessage | None:
+        """
+        Handle streaming extraction for raw tool call format.
+        This is used when model outputs tool calls without special tokens.
+        Uses bracket counting to detect complete JSON objects.
+        """
+        try:
+            # If we're in potential mode (prefix detected), check if it's confirmed
+            if self.potential_raw_tool_call and not self.in_raw_tool_call:
+                # Check if we now have the full pattern
+                match = self.raw_tool_call_start_regex.search(self.token_buffer)
+                if match:
+                    # Confirmed! Transition to in_raw_tool_call
+                    self.potential_raw_tool_call = False
+                    self.in_raw_tool_call = True
+                    self.raw_tool_call_name = match.group("function_name")
+                    self.raw_tool_call_index = match.group("tool_index")
+                    json_start = match.end() - 1
+                    self.raw_tool_call_buffer = self.token_buffer[json_start:]
+                    self.raw_tool_brace_depth = 0
+
+                    # Count braces in what we have so far
+                    in_string = False
+                    escape_next = False
+                    for char in self.raw_tool_call_buffer:
+                        if escape_next:
+                            escape_next = False
+                            continue
+                        if char == "\\":
+                            escape_next = True
+                            continue
+                        if char == '"':
+                            in_string = not in_string
+                        elif not in_string:
+                            if char == "{":
+                                self.raw_tool_brace_depth += 1
+                            elif char == "}":
+                                self.raw_tool_brace_depth -= 1
+
+                    logger.debug(
+                        "Confirmed raw tool call: %s:%s, brace_depth=%d",
+                        self.raw_tool_call_name,
+                        self.raw_tool_call_index,
+                        self.raw_tool_brace_depth,
+                    )
+                    # Continue to process as in_raw_tool_call below
+                elif self.raw_tool_call_header_regex.search(self.token_buffer):
+                    # Still looks like it could be a tool call, keep waiting
+                    return DeltaMessage(content="")
+                elif self.raw_tool_call_partial_regex.search(self.token_buffer):
+                    # Partial pattern detected, keep waiting
+                    return DeltaMessage(content="")
+                else:
+                    # Check if we still have a prefix
+                    buffer_end = self.token_buffer[-20:] if len(self.token_buffer) > 20 else self.token_buffer
+                    has_prefix = any(buffer_end.endswith(p) for p in self.raw_tool_call_prefixes)
+                    if has_prefix:
+                        # Still have a prefix, keep waiting
+                        return DeltaMessage(content="")
+                    # The potential tool call didn't pan out
+                    # This shouldn't happen often, but release buffered content
+                    logger.debug("Potential raw tool call did not confirm, releasing buffer")
+                    self.potential_raw_tool_call = False
+                    # Return the delta as content since it's not a tool call
+                    return DeltaMessage(content=delta_text)
+
+            # If we're not in a raw tool call, check if one is starting
+            if not self.in_raw_tool_call:
+                match = self.raw_tool_call_start_regex.search(self.token_buffer)
+                if match:
+                    self.in_raw_tool_call = True
+                    self.raw_tool_call_name = match.group("function_name")
+                    self.raw_tool_call_index = match.group("tool_index")
+                    # Start buffering from the { onwards
+                    json_start = match.end() - 1
+                    self.raw_tool_call_buffer = self.token_buffer[json_start:]
+                    self.raw_tool_brace_depth = 0
+
+                    # Count braces in what we have so far
+                    in_string = False
+                    escape_next = False
+                    for char in self.raw_tool_call_buffer:
+                        if escape_next:
+                            escape_next = False
+                            continue
+                        if char == "\\":
+                            escape_next = True
+                            continue
+                        if char == '"':
+                            in_string = not in_string
+                        elif not in_string:
+                            if char == "{":
+                                self.raw_tool_brace_depth += 1
+                            elif char == "}":
+                                self.raw_tool_brace_depth -= 1
+
+                    logger.debug(
+                        "Started raw tool call: %s:%s, brace_depth=%d",
+                        self.raw_tool_call_name,
+                        self.raw_tool_call_index,
+                        self.raw_tool_brace_depth,
+                    )
+
+                    # Suppress content - we're in tool call mode
+                    return DeltaMessage(content="")
+                else:
+                    # No tool call detected yet, but check for partial match
+                    # Look for patterns like "functions." or "Edit:" that might
+                    # indicate an incoming tool call
+                    if self.raw_tool_call_header_regex.search(self.token_buffer):
+                        # Partial match - suppress output and wait for more
+                        return DeltaMessage(content="")
+                    return None
+
+            # We're in a raw tool call - accumulate and check for completion
+            # Add delta to the JSON buffer
+            self.raw_tool_call_buffer += delta_text
+
+            # Update brace depth for new content
+            in_string = False
+            escape_next = False
+
+            # We need to track string state from the beginning of buffer
+            for char in delta_text:
+                if escape_next:
+                    escape_next = False
+                    continue
+                if char == "\\":
+                    escape_next = True
+                    continue
+                if char == '"':
+                    in_string = not in_string
+                elif not in_string:
+                    if char == "{":
+                        self.raw_tool_brace_depth += 1
+                    elif char == "}":
+                        self.raw_tool_brace_depth -= 1
+
+            logger.debug(
+                "Raw tool call buffer update: depth=%d, buffer_len=%d",
+                self.raw_tool_brace_depth,
+                len(self.raw_tool_call_buffer),
+            )
+
+            # Check if JSON is complete (all braces closed)
+            if self.raw_tool_brace_depth == 0 and "{" in self.raw_tool_call_buffer:
+                # JSON is complete
+                function_args = self.raw_tool_call_buffer.strip()
+
+                # Validate JSON
+                try:
+                    json.loads(function_args)
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        "Invalid JSON in raw tool call: %s (error: %s)",
+                        function_args[:100],
+                        str(e),
+                    )
+                    # Reset state
+                    self.in_raw_tool_call = False
+                    self.raw_tool_call_buffer = ""
+                    return None
+
+                tool_id = f"functions.{self.raw_tool_call_name}:{self.raw_tool_call_index}"
+
+                # Check if this is a new tool call or continuation
+                if not self.current_tool_name_sent:
+                    self.current_tool_id += 1
+                    self.current_tool_name_sent = True
+                    self.streamed_args_for_tool.append(function_args)
+
+                    logger.debug(
+                        "Emitting complete raw tool call: %s with args length %d",
+                        tool_id,
+                        len(function_args),
+                    )
+
+                    # Reset raw tool call state for next potential tool call
+                    self.in_raw_tool_call = False
+                    self.raw_tool_call_buffer = ""
+
+                    # Emit the complete tool call
+                    return DeltaMessage(
+                        tool_calls=[
+                            DeltaToolCall(
+                                index=self.current_tool_id,
+                                type="function",
+                                id=tool_id,
+                                function=DeltaFunctionCall(
+                                    name=self.raw_tool_call_name,
+                                    arguments=function_args,
+                                ).model_dump(exclude_none=True),
+                            )
+                        ]
+                    )
+
+                # Reset for next tool call
+                self.in_raw_tool_call = False
+                self.raw_tool_call_buffer = ""
+                self.current_tool_name_sent = False
+                return None
+
+            # JSON not complete yet, suppress output
+            return DeltaMessage(content="")
+
+        except Exception:
+            logger.exception("Error in raw tool call streaming extraction.")
+            self.in_raw_tool_call = False
+            self.raw_tool_call_buffer = ""
+            return None
+
     def extract_tool_calls(
         self,
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
-        # sanity check; avoid unnecessary processing
-        if self.tool_calls_start_token not in model_output:
-            return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=[], content=model_output
-            )
-
-        else:
+        # First, try to extract using special tokens (preferred format)
+        if self.tool_calls_start_token in model_output:
             try:
                 # there are two possible captures - between tags, or between a
                 # tag and end-of-string so the result of
@@ -193,9 +582,11 @@ class KimiK2ToolParser(ToolParser):
 
             except Exception:
                 logger.exception("Error in extracting tool call from response.")
-                return ExtractedToolCallInformation(
-                    tools_called=False, tool_calls=[], content=model_output
-                )
+                # Fall through to try raw format
+
+        # Fallback: try to extract raw format tool calls (functions.X:N{...})
+        # This handles cases where model outputs without special tokens
+        return self._extract_raw_tool_calls(model_output)
 
     def extract_tool_calls_streaming(
         self,
@@ -275,12 +666,66 @@ class KimiK2ToolParser(ToolParser):
             tid in current_token_ids for tid in self.tool_calls_start_token_ids
         )
 
-        # Early return: if no section token detected yet, return as reasoning content
-        if not has_section_token and not self.in_tool_section:
+        # Check for raw tool call pattern in buffer (fallback for models that
+        # don't use special tokens). Check for:
+        # 1. Already in raw tool call mode
+        # 2. Complete raw tool call start pattern (functions.X:N{)
+        # 3. Partial pattern that could become a tool call (functions.X:N)
+        # 4. Early prefix that might become a tool call (functions. or Edit:)
+        has_raw_tool_call = self.in_raw_tool_call or self.potential_raw_tool_call
+
+        if not has_raw_tool_call:
+            # Check for complete or partial patterns
+            if self.raw_tool_call_start_regex.search(self.token_buffer):
+                has_raw_tool_call = True
+            elif self.raw_tool_call_header_regex.search(self.token_buffer):
+                has_raw_tool_call = True
+            elif self.raw_tool_call_partial_regex.search(self.token_buffer):
+                # Partial pattern like "functions.Edit" or "functions.Edit:"
+                self.potential_raw_tool_call = True
+                has_raw_tool_call = True
+                logger.debug(
+                    "Detected partial raw tool call pattern in buffer"
+                )
+            else:
+                # Check for early prefixes at end of buffer
+                buffer_end = self.token_buffer[-20:] if len(self.token_buffer) > 20 else self.token_buffer
+                for prefix in self.raw_tool_call_prefixes:
+                    if buffer_end.endswith(prefix):
+                        # Early prefix detected - start buffering
+                        self.potential_raw_tool_call = True
+                        has_raw_tool_call = True
+                        logger.debug(
+                            "Detected potential raw tool call prefix: %s",
+                            prefix,
+                        )
+                        break
+
+        # Early return: if no section token and no raw tool call detected yet,
+        # return as content
+        if not has_section_token and not self.in_tool_section and not has_raw_tool_call:
             logger.debug("No tool call tokens found!")
             # Don't clear buffer - it needs to accumulate partial markers across deltas
             # Buffer overflow is already protected by lines 215-224
             return DeltaMessage(content=delta_text)
+
+        # If we detected a raw tool call pattern (or are in raw mode) but no
+        # special tokens, handle via raw extraction
+        if has_raw_tool_call and not has_section_token and not self.in_tool_section:
+            logger.debug(
+                "Processing raw tool call: in_raw=%s, buffer_len=%d",
+                self.in_raw_tool_call,
+                len(self.token_buffer),
+            )
+            # For streaming with raw format, we'll collect in buffer and emit
+            # tool calls when we detect a complete JSON object
+            result = self._extract_raw_tool_calls_streaming(
+                previous_text, current_text, delta_text
+            )
+            if result is not None:
+                return result
+            # If extraction returned None, continue with normal flow
+            return None
 
         # Strip section markers from delta_text for subsequent processing
         # NOTE: This preprocessing happens BEFORE the regex-based tool call
