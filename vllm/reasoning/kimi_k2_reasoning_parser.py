@@ -199,7 +199,6 @@ class KimiK2ReasoningParser(ReasoningParser):
                 delta_token_ids,
             )
 
-        # If reasoning has already ended in previous tokens, this is content
         if self.is_reasoning_end(previous_token_ids):
             return DeltaMessage(content=delta_text)
 
