@@ -1560,6 +1560,25 @@ class OpenAIServingChat(OpenAIServing):
                 choices.append(choice_data)
                 continue
 
+            # --- DEBUG: dump raw model output before any parsing ---
+            logger.debug(
+                "[kimi-debug] raw output.text (repr): %s",
+                repr(output.text[:2000]),
+            )
+            logger.debug(
+                "[kimi-debug] output.finish_reason=%s  "
+                "output.stop_reason=%s  "
+                "output token_ids count=%d  "
+                "last 20 token_ids=%s",
+                output.finish_reason,
+                output.stop_reason,
+                len(output.token_ids) if output.token_ids else 0,
+                list(output.token_ids[-20:])
+                if output.token_ids
+                else "N/A",
+            )
+            # --- END DEBUG ---
+
             if self.reasoning_parser:
                 try:
                     if tokenizer is None:
@@ -1584,6 +1603,14 @@ class OpenAIServingChat(OpenAIServing):
                 reasoning, content = reasoning_parser.extract_reasoning(
                     output.text, request=request
                 )
+                # --- DEBUG: show reasoning parser output ---
+                logger.debug(
+                    "[kimi-debug] extract_reasoning -> "
+                    "reasoning=%s  content=%s",
+                    repr(reasoning[:500]) if reasoning else None,
+                    repr(content[:500]) if content else None,
+                )
+                # --- END DEBUG ---
                 if not request.include_reasoning:
                     reasoning = None
             else:
@@ -1593,6 +1620,12 @@ class OpenAIServingChat(OpenAIServing):
             auto_tools_called = False
             # if auto tools are not enabled, and a named tool choice using
             #   outlines is not being used
+            # --- DEBUG: show what tool parser will receive ---
+            logger.debug(
+                "[kimi-debug] content passed to tool parser: %s",
+                repr(content[:500]) if content else None,
+            )
+            # --- END DEBUG ---
             tool_calls, content = self._parse_tool_calls_from_content(
                 request=request,
                 tokenizer=tokenizer,
@@ -1600,6 +1633,14 @@ class OpenAIServingChat(OpenAIServing):
                 enable_auto_tools=self.enable_auto_tools,
                 tool_parser_cls=self.tool_parser,
             )
+            # --- DEBUG: show tool parser result ---
+            logger.debug(
+                "[kimi-debug] tool parser result -> "
+                "tool_calls=%s  content=%s",
+                tool_calls,
+                repr(content[:500]) if content else None,
+            )
+            # --- END DEBUG ---
 
             # Copy reasoning to content if:
             # - content is None or empty

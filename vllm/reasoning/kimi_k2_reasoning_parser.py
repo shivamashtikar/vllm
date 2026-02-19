@@ -9,8 +9,11 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
 )
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+from vllm.logger import init_logger
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
+
+logger = init_logger(__name__)
 
 
 class KimiK2ReasoningParser(ReasoningParser):
@@ -153,16 +156,40 @@ class KimiK2ReasoningParser(ReasoningParser):
         if self._is_identity_mode():
             return self._identity_parser.extract_reasoning(model_output, request)
 
+        logger.debug(
+            "[kimi-debug] extract_reasoning input (repr, first 1000): %s",
+            repr(model_output[:1000]),
+        )
+
         # thinking does not require a think start token but consume it if present
         start_token_index = model_output.find(self._start_token)
         start_token_index = 0 if start_token_index != 0 else len(self._start_token)
         end_token_index = model_output.find(self._end_token)
 
+        logger.debug(
+            "[kimi-debug] start_token=%s found_at=%d  "
+            "end_token=%s found_at=%d  "
+            "tool_section_token=%s found_at=%d",
+            self._start_token,
+            model_output.find(self._start_token),
+            self._end_token,
+            end_token_index,
+            self._tool_section_start_token,
+            model_output.find(self._tool_section_start_token),
+        )
+
         if end_token_index != -1:
-            return (
-                model_output[start_token_index:end_token_index],
-                model_output[end_token_index + len(self._end_token) :] or None,
+            reasoning = model_output[start_token_index:end_token_index]
+            content = (
+                model_output[end_token_index + len(self._end_token) :] or None
             )
+            logger.debug(
+                "[kimi-debug] split at </think>: "
+                "reasoning len=%d  content repr=%s",
+                len(reasoning) if reasoning else 0,
+                repr(content[:500]) if content else None,
+            )
+            return (reasoning, content)
 
         tool_section_index = model_output.find(self._tool_section_start_token)
         if tool_section_index != -1:
@@ -172,6 +199,10 @@ class KimiK2ReasoningParser(ReasoningParser):
             )
 
         # still reasoning (no content)
+        logger.debug(
+            "[kimi-debug] no </think> or tool_section found, "
+            "treating all as reasoning"
+        )
         return (
             model_output[start_token_index:],
             None,

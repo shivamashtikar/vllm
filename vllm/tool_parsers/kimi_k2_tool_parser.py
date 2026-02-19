@@ -167,6 +167,16 @@ class KimiK2ToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
+        logger.debug(
+            "[kimi-debug] extract_tool_calls called, "
+            "model_output (repr, first 500): %s",
+            repr(model_output[:500]),
+        )
+        logger.debug(
+            "[kimi-debug] looking for start_token=%s  present=%s",
+            self.tool_calls_start_token,
+            self.tool_calls_start_token in model_output,
+        )
         # sanity check; avoid unnecessary processing
         if self.tool_calls_start_token not in model_output:
             return ExtractedToolCallInformation(
