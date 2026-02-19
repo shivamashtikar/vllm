@@ -27,6 +27,20 @@ logger = init_logger(__name__)
 
 
 class KimiK2ToolParser(ToolParser):
+
+    def adjust_request(
+        self, request: ChatCompletionRequest
+    ) -> ChatCompletionRequest:
+        request = super().adjust_request(request)
+        if request.tools and request.tool_choice != "none":
+            # do not skip special tokens because the tool_call tokens
+            # (e.g. <|tool_calls_section_begin|>, <|tool_call_begin|>, etc.)
+            # are marked "special" in the Kimi-K2 tokenizer.  When they are
+            # stripped by the detokenizer the tool-call parser never sees them
+            # and silently drops every tool call.
+            request.skip_special_tokens = False
+        return request
+
     def __init__(self, tokenizer: TokenizerLike):
         super().__init__(tokenizer)
         self.current_tool_name_sent: bool = False
