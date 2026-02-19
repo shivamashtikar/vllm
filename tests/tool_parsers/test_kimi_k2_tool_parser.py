@@ -923,3 +923,152 @@ def test_streaming_multiple_tool_calls_not_leaked(kimi_k2_tool_parser):
 
     # Legitimate content preserved
     assert "compare" in full_content.lower() or len(all_content) > 0
+
+
+def test_extract_tool_calls_no_leading_space_without_functions_prefix(
+    kimi_k2_tool_parser,
+):
+    """
+    Regression test: tool names without 'functions.' prefix and with
+    leading whitespace must be stripped in non-streaming mode.
+
+    Reproduces the bug where opencode received tool names like ' read'
+    instead of 'read', causing tool call failures.
+    """
+    model_output = (
+        "I will read the file. <|tool_calls_section_begin|>"
+        "<|tool_call_begin|> read:0 <|tool_call_argument_begin|> "
+        '{"file_path": "/tmp/test.txt"} <|tool_call_end|>'
+        "<|tool_calls_section_end|>"
+    )
+
+    extracted = kimi_k2_tool_parser.extract_tool_calls(model_output, request=None)
+    assert extracted.tools_called
+    assert len(extracted.tool_calls) == 1
+    assert extracted.tool_calls[0].function.name == "read", (
+        f"Expected 'read', got {repr(extracted.tool_calls[0].function.name)}"
+    )
+    assert extracted.tool_calls[0].function.name == extracted.tool_calls[0].function.name.strip()
+
+
+def test_extract_tool_calls_no_leading_space_with_functions_prefix_and_space(
+    kimi_k2_tool_parser,
+):
+    """
+    Regression test: tool names with 'functions.' prefix but with space
+    after the dot must be stripped.
+    """
+    model_output = (
+        "Let me check. <|tool_calls_section_begin|>"
+        "<|tool_call_begin|>functions. grep:0 <|tool_call_argument_begin|> "
+        '{"pattern": "error"} <|tool_call_end|>'
+        "<|tool_calls_section_end|>"
+    )
+
+    extracted = kimi_k2_tool_parser.extract_tool_calls(model_output, request=None)
+    assert extracted.tools_called
+    assert len(extracted.tool_calls) == 1
+    assert extracted.tool_calls[0].function.name == "grep", (
+        f"Expected 'grep', got {repr(extracted.tool_calls[0].function.name)}"
+    )
+
+
+def test_streaming_tool_name_no_leading_space(kimi_k2_tool_parser):
+    """
+    CRITICAL REGRESSION TEST: Verify that tool names extracted during
+    streaming do NOT have leading whitespace, even when BPE tokenization
+    produces tokens like ' read' with a leading space after
+    <|tool_call_begin|>.
+
+    This reproduces the bug where opencode received tool names like
+    ' read' instead of 'read', causing tool call failures.
+    """
+    kimi_k2_tool_parser.reset_streaming_state()
+
+    section_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_begin|>")
+    section_end_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_end|>")
+    tool_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_call_begin|>")
+    tool_end_id = kimi_k2_tool_parser.vocab.get("<|tool_call_end|>")
+
+    # Simulate realistic streaming where tokens arrive incrementally.
+    # The leading space in " read:0" is the key bug trigger - BPE
+    # tokenizers commonly produce " read" as a single token.
+    deltas = [
+        ("Let me read that file. ", [1, 2, 3]),
+        ("<|tool_calls_section_begin|>", [section_begin_id]),
+        ("<|tool_call_begin|>", [tool_begin_id]),
+        (" read:0 <|tool_call_argument_begin|> ", [10, 11]),
+        ('{"file_path": "/tmp/test.txt"}', [12, 13]),
+        (" <|tool_call_end|>", [tool_end_id]),
+        ("<|tool_calls_section_end|>", [section_end_id]),
+    ]
+
+    results = run_streaming_sequence(kimi_k2_tool_parser, deltas)
+
+    # Find the result that contains the tool call name
+    found_tool_name = False
+    for result in results:
+        if result and result.tool_calls:
+            for tc in result.tool_calls:
+                fn = tc.function
+                if isinstance(fn, dict) and "name" in fn:
+                    assert fn["name"] == fn["name"].strip(), (
+                        f"Tool name has leading/trailing whitespace: {repr(fn['name'])}"
+                    )
+                    assert fn["name"] == "read", (
+                        f"Expected 'read', got {repr(fn['name'])}"
+                    )
+                    found_tool_name = True
+                elif hasattr(fn, "name") and fn.name:
+                    assert fn.name == fn.name.strip(), (
+                        f"Tool name has leading/trailing whitespace: {repr(fn.name)}"
+                    )
+                    assert fn.name == "read", (
+                        f"Expected 'read', got {repr(fn.name)}"
+                    )
+                    found_tool_name = True
+
+    assert found_tool_name, "No tool name was found in streaming results"
+
+
+def test_streaming_grep_tool_name_no_leading_space(kimi_k2_tool_parser):
+    """
+    Regression test: verify 'grep' tool name has no leading space
+    in streaming mode. Both read and grep were reported failing.
+    """
+    kimi_k2_tool_parser.reset_streaming_state()
+
+    section_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_begin|>")
+    section_end_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_end|>")
+    tool_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_call_begin|>")
+    tool_end_id = kimi_k2_tool_parser.vocab.get("<|tool_call_end|>")
+
+    deltas = [
+        ("Searching for errors. ", [1, 2, 3]),
+        ("<|tool_calls_section_begin|>", [section_begin_id]),
+        ("<|tool_call_begin|>", [tool_begin_id]),
+        (" grep:0 <|tool_call_argument_begin|> ", [10, 11]),
+        ('{"pattern": "error", "path": "/src"}', [12, 13]),
+        (" <|tool_call_end|>", [tool_end_id]),
+        ("<|tool_calls_section_end|>", [section_end_id]),
+    ]
+
+    results = run_streaming_sequence(kimi_k2_tool_parser, deltas)
+
+    found_tool_name = False
+    for result in results:
+        if result and result.tool_calls:
+            for tc in result.tool_calls:
+                fn = tc.function
+                if isinstance(fn, dict) and "name" in fn:
+                    assert fn["name"] == "grep", (
+                        f"Expected 'grep', got {repr(fn['name'])}"
+                    )
+                    found_tool_name = True
+                elif hasattr(fn, "name") and fn.name:
+                    assert fn.name == "grep", (
+                        f"Expected 'grep', got {repr(fn.name)}"
+                    )
+                    found_tool_name = True
+
+    assert found_tool_name, "No tool name was found in streaming results"

@@ -109,7 +109,7 @@ def extract_harmony_streaming_delta(
             opened_new_call = False
             if prev_recipient != group.recipient:
                 # New tool call - emit the opening message
-                tool_name = group.recipient.split("functions.", 1)[1]
+                tool_name = group.recipient.split("functions.", 1)[1].strip()
                 tool_messages.append(
                     DeltaToolCall(
                         id=make_tool_call_id(),

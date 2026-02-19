@@ -41,9 +41,9 @@ class KimiK2ToolParser(ToolParser):
         self.token_buffer: str = ""
         # Buffer size: empirical worst-case for longest marker (~30 chars) * 2
         # + safety margin for unicode + partial overlap. Prevents unbounded growth.
-        self.buffer_max_size: int = 49152
+        self.buffer_max_size: int = 131072
         self.section_char_count: int = 0  # Track characters processed in tool section
-        self.max_section_chars: int = 49152  # Force exit if section exceeds this
+        self.max_section_chars: int = 131072  # Force exit if section exceeds this
         self._buffer_overflow_logged: bool = False  # Log overflow once per session
 
         # Support both singular and plural variants
@@ -67,10 +67,10 @@ class KimiK2ToolParser(ToolParser):
         )
 
         self.stream_tool_call_portion_regex = re.compile(
-            r"(?P<tool_call_id>.+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>.*)"
+            r"\s*(?P<tool_call_id>.+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>.*)"
         )
 
-        self.stream_tool_call_name_regex = re.compile(r"(?P<tool_call_id>.+:\d+)\s*")
+        self.stream_tool_call_name_regex = re.compile(r"\s*(?P<tool_call_id>.+:\d+)\s*")
 
         if not self.model_tokenizer:
             raise ValueError(
@@ -173,7 +173,7 @@ class KimiK2ToolParser(ToolParser):
                 for match in function_call_tuples:
                     function_id, function_args = match
                     # function_id: functions.get_weather:0 or get_weather:0
-                    function_name = function_id.split(":")[0].split(".")[-1]
+                    function_name = function_id.split(":")[0].split(".")[-1].strip()
                     tool_calls.append(
                         ToolCall(
                             id=function_id,
@@ -342,7 +342,7 @@ class KimiK2ToolParser(ToolParser):
                 tool_call_portion = (
                     full_text.split(self.tool_call_start_token)[-1]
                     .split(self.tool_call_end_token)[0]
-                    .rstrip()
+                    .strip()
                 )
                 delta_text = delta_text.split(self.tool_call_end_token)[0].rstrip()
                 text_portion = delta_text.split(self.tool_call_end_token)[-1].lstrip()
@@ -355,7 +355,7 @@ class KimiK2ToolParser(ToolParser):
                 if len(delta_token_ids) > 1:
                     tool_call_portion = current_text.split(self.tool_call_start_token)[
                         -1
-                    ]
+                    ].strip()
                 else:
                     tool_call_portion = None
                     delta = None
@@ -374,7 +374,7 @@ class KimiK2ToolParser(ToolParser):
                 and cur_tool_start_count == prev_tool_start_count
             ):
                 # get the portion of the text that's the tool call
-                tool_call_portion = current_text.split(self.tool_call_start_token)[-1]
+                tool_call_portion = current_text.split(self.tool_call_start_token)[-1].strip()
                 text_portion = None
 
             # case -- the current tool call is being closed.
@@ -447,7 +447,7 @@ class KimiK2ToolParser(ToolParser):
                 )
                 if current_tool_call_matches:
                     tool_id, tool_args = current_tool_call_matches.groups()
-                    tool_name = tool_id.split(":")[0].split(".")[-1]
+                    tool_name = tool_id.split(":")[0].split(".")[-1].strip()
                     current_tool_call["id"] = tool_id.strip()
                     current_tool_call["name"] = tool_name
                     current_tool_call["arguments"] = tool_args
@@ -457,7 +457,7 @@ class KimiK2ToolParser(ToolParser):
                     )
                     if current_tool_call_name_matches:
                         (tool_id_str,) = current_tool_call_name_matches.groups()
-                        tool_name = tool_id_str.split(":")[0].split(".")[-1]
+                        tool_name = tool_id_str.split(":")[0].split(".")[-1].strip()
                         current_tool_call["id"] = tool_id_str.strip()
                         current_tool_call["name"] = tool_name
                         current_tool_call["arguments"] = ""

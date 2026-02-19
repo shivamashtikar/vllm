@@ -534,7 +534,7 @@ def _parse_browser_tool_call(message: Message, recipient: str) -> ResponseOutput
 
 def _parse_function_call(message: Message, recipient: str) -> list[ResponseOutputItem]:
     """Parse function calls into function tool call items."""
-    function_name = recipient.split(".")[-1]
+    function_name = recipient.split(".")[-1].strip()
     output_items = []
     for content in message.content:
         random_id = random_uuid()
@@ -599,8 +599,8 @@ def _parse_mcp_recipient(recipient: str) -> tuple[str, str]:
         - tool_name: "filesystem"
     """
     if "." in recipient:
-        server_label = recipient.split(".")[0]
-        tool_name = recipient.split(".")[-1]
+        server_label = recipient.split(".")[0].strip()
+        tool_name = recipient.split(".")[-1].strip()
     else:
         server_label = recipient
         tool_name = recipient
@@ -695,7 +695,7 @@ def parse_remaining_state(parser: StreamableParser) -> list[ResponseOutputItem]:
                     arguments=parser.current_content,
                     call_id=f"call_{rid}",
                     type="function_call",
-                    name=current_recipient.split(".")[-1],
+                    name=current_recipient.split(".")[-1].strip(),
                     id=f"fc_{rid}",
                     status="in_progress",
                 )
