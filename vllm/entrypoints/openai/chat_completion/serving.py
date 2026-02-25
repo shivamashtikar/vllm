@@ -89,6 +89,37 @@ from vllm.v1.sample.logits_processor import validate_logits_processors_parameter
 logger = init_logger(__name__)
 
 
+class MalformedToolCallError(Exception):
+    """Raised when the model produces degenerate output such as
+    hallucinated tool-call-like text in the reasoning block without
+    ever closing the think block."""
+    pass
+
+
+# Minimum number of hallucinated tool-call pattern occurrences in reasoning
+# before triggering a failure. A single occurrence could be legitimate (the
+# model discussing tool calls in its thinking). 3+ repetitions is a clear
+# signal of degenerate output where the model dropped the </think> tag and
+# is looping on hallucinated tool-call-like text.
+_HALLUCINATED_TOOL_CALL_THRESHOLD = 3
+_HALLUCINATED_TOOL_CALL_MARKER = "<function_calls>"
+
+
+def _detect_hallucinated_tool_calls_in_reasoning(
+    reasoning: str,
+    threshold: int = _HALLUCINATED_TOOL_CALL_THRESHOLD,
+) -> bool:
+    """Check if accumulated reasoning contains repeated hallucinated
+    tool-call patterns, indicating the model is stuck generating
+    degenerate output without ever closing the think block.
+
+    Returns True if the hallucinated pattern count meets or exceeds
+    the threshold.
+    """
+    count = reasoning.count(_HALLUCINATED_TOOL_CALL_MARKER)
+    return count >= threshold
+
+
 class OpenAIServingChat(OpenAIServing):
     def __init__(
         self,
@@ -1216,6 +1247,29 @@ class OpenAIServingChat(OpenAIServing):
                             and delta_message.reasoning
                         ):
                             accumulated_reasoning_arr[i] += delta_message.reasoning
+
+                            # Detect hallucinated tool-call patterns in
+                            # reasoning. If the model is stuck generating
+                            # degenerate tool-call-like text inside the
+                            # think block (without ever closing </think>),
+                            # abort early with a 5XX error.
+                            if (
+                                not reasoning_end_arr[i]
+                                and tool_choice_auto
+                                and _detect_hallucinated_tool_calls_in_reasoning(
+                                    accumulated_reasoning_arr[i]
+                                )
+                            ):
+                                raise MalformedToolCallError(
+                                    "Model produced degenerate output: "
+                                    "repeated hallucinated tool-call "
+                                    "patterns detected in reasoning "
+                                    "content without closing the think "
+                                    "block. The model is likely stuck in "
+                                    "a loop generating malformed tool "
+                                    "call text."
+                                )
+
                         if seen_content_arr is not None and delta_message.content:
                             seen_content_arr[i] = True
 
@@ -1450,6 +1504,19 @@ class OpenAIServingChat(OpenAIServing):
 
         except GenerationError as e:
             yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
+        except MalformedToolCallError as e:
+            from http import HTTPStatus
+            logger.error(
+                "Malformed tool call detected for request %s: %s",
+                request_id,
+                str(e),
+            )
+            data = self.create_streaming_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            yield f"data: {data}\n\n"
         except Exception as e:
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
@@ -1600,6 +1667,34 @@ class OpenAIServingChat(OpenAIServing):
                 enable_auto_tools=self.enable_auto_tools,
                 tool_parser_cls=self.tool_parser,
             )
+
+            # Detect hallucinated tool-call patterns in reasoning content.
+            # If the model generated degenerate tool-call-like text inside
+            # the think block without ever closing </think>, and the request
+            # had tools configured, fail with 5XX instead of serving garbage.
+            if (
+                not content  # content is None (reasoning never ended)
+                and reasoning  # reasoning has content
+                and self.tool_parser  # tools were configured
+                and self.enable_auto_tools
+                and _detect_hallucinated_tool_calls_in_reasoning(reasoning)
+            ):
+                from http import HTTPStatus
+                logger.error(
+                    "Malformed tool call detected for request %s: "
+                    "repeated hallucinated tool-call patterns found in "
+                    "reasoning content without closing the think block.",
+                    request_id,
+                )
+                return self.create_error_response(
+                    "Model produced degenerate output: repeated "
+                    "hallucinated tool-call patterns detected in "
+                    "reasoning content without closing the think "
+                    "block. The model is likely stuck in a loop "
+                    "generating malformed tool call text.",
+                    err_type="InternalServerError",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
 
             # Copy reasoning to content if:
             # - content is None or empty
