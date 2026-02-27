@@ -96,6 +96,14 @@ class MalformedToolCallError(Exception):
     pass
 
 
+class MalformedReasoningError(Exception):
+    """Raised when the model produces degenerate output containing
+    special tokens (e.g. <|...|>) that leaked into reasoning or
+    content text, or when reasoning artifacts like </thinking>
+    appear in content."""
+    pass
+
+
 # Minimum number of hallucinated tool-call pattern occurrences in reasoning
 # before triggering a failure. A single occurrence could be legitimate (the
 # model discussing tool calls in its thinking). 3+ repetitions is a clear
@@ -103,6 +111,17 @@ class MalformedToolCallError(Exception):
 # is looping on hallucinated tool-call-like text.
 _HALLUCINATED_TOOL_CALL_THRESHOLD = 3
 _HALLUCINATED_TOOL_CALL_MARKER = "<function_calls>"
+
+# Regex pattern to detect special tokens like <|...|> in text.
+# These are model-internal control tokens that should never appear in
+# reasoning or content output. A single occurrence is always degenerate.
+_SPECIAL_TOKEN_PATTERN = re.compile(r"<\|[^|]+\|>")
+
+# Leaked reasoning artifacts that should never appear in content.
+# The model sometimes outputs </thinking> instead of </think>, and if
+# the reasoning parser doesn't catch it (e.g. token not in vocab), it
+# leaks into content as literal text.
+_LEAKED_REASONING_MARKER = "</thinking>"
 
 
 def _detect_hallucinated_tool_calls_in_reasoning(
@@ -118,6 +137,20 @@ def _detect_hallucinated_tool_calls_in_reasoning(
     """
     count = reasoning.count(_HALLUCINATED_TOOL_CALL_MARKER)
     return count >= threshold
+
+
+def _detect_special_tokens_in_text(text: str) -> str | None:
+    """Check if text contains any special tokens matching <|...|> pattern.
+
+    These are model-internal control tokens (e.g. <|im_end|>,
+    <|tool_call_begin|>) that should never appear in reasoning or
+    content output. Their presence indicates the model is producing
+    degenerate output.
+
+    Returns the matched token string if found, None otherwise.
+    """
+    match = _SPECIAL_TOKEN_PATTERN.search(text)
+    return match.group(0) if match else None
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -1270,8 +1303,51 @@ class OpenAIServingChat(OpenAIServing):
                                     "call text."
                                 )
 
+                            # Detect special tokens (<|...|>) leaked
+                            # into reasoning text. Any single occurrence
+                            # is degenerate — these are model-internal
+                            # control tokens that should never appear in
+                            # output text.
+                            leaked_token = _detect_special_tokens_in_text(
+                                delta_message.reasoning
+                            )
+                            if leaked_token:
+                                raise MalformedReasoningError(
+                                    f"Model produced degenerate output: "
+                                    f"special token {leaked_token!r} "
+                                    f"detected in reasoning content. "
+                                    f"This indicates the model is "
+                                    f"generating malformed output with "
+                                    f"leaked control tokens."
+                                )
+
                         if seen_content_arr is not None and delta_message.content:
                             seen_content_arr[i] = True
+
+                        # Detect special tokens (<|...|>) or leaked
+                        # reasoning artifacts (</thinking>) in content
+                        # text during streaming.
+                        if delta_message.content:
+                            leaked_token = _detect_special_tokens_in_text(
+                                delta_message.content
+                            )
+                            if leaked_token:
+                                raise MalformedReasoningError(
+                                    f"Model produced degenerate output: "
+                                    f"special token {leaked_token!r} "
+                                    f"detected in content. This indicates "
+                                    f"the model is generating malformed "
+                                    f"output with leaked control tokens."
+                                )
+                            if _LEAKED_REASONING_MARKER in delta_message.content:
+                                raise MalformedReasoningError(
+                                    "Model produced degenerate output: "
+                                    "reasoning artifact '</thinking>' "
+                                    "detected in content. This indicates "
+                                    "the model leaked its internal "
+                                    "reasoning structure into the "
+                                    "response."
+                                )
 
                     # Log streaming delta if output logging is enabled
                     if self.enable_log_outputs and self.request_logger:
@@ -1517,6 +1593,19 @@ class OpenAIServingChat(OpenAIServing):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             yield f"data: {data}\n\n"
+        except MalformedReasoningError as e:
+            from http import HTTPStatus
+            logger.error(
+                "Malformed reasoning detected for request %s: %s",
+                request_id,
+                str(e),
+            )
+            data = self.create_streaming_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            yield f"data: {data}\n\n"
         except Exception as e:
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
@@ -1695,6 +1784,29 @@ class OpenAIServingChat(OpenAIServing):
                     err_type="InternalServerError",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
+
+            # Detect special tokens (<|...|>) leaked into reasoning.
+            # Any occurrence is degenerate — these are model-internal
+            # control tokens that should never appear in output text.
+            if reasoning:
+                leaked_token = _detect_special_tokens_in_text(reasoning)
+                if leaked_token:
+                    from http import HTTPStatus
+                    logger.error(
+                        "Special token leak detected for request %s: "
+                        "token %r found in reasoning content.",
+                        request_id,
+                        leaked_token,
+                    )
+                    return self.create_error_response(
+                        f"Model produced degenerate output: special "
+                        f"token {leaked_token!r} detected in reasoning "
+                        f"content. This indicates the model is "
+                        f"generating malformed output with leaked "
+                        f"control tokens.",
+                        err_type="InternalServerError",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
 
             # Copy reasoning to content if:
             # - content is None or empty
