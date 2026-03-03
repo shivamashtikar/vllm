@@ -115,7 +115,10 @@ _HALLUCINATED_TOOL_CALL_MARKER = "<function_calls>"
 # Regex pattern to detect special tokens like <|...|> in text.
 # These are model-internal control tokens that should never appear in
 # reasoning or content output. A single occurrence is always degenerate.
-_SPECIAL_TOKEN_PATTERN = re.compile(r"<\|[^|]+\|>")
+# Uses \S+? (non-greedy, non-whitespace) to avoid matching the bare <|>
+# operator (e.g. Haskell's alternative operator) or greedily spanning
+# across unrelated text between two <|> occurrences.
+_SPECIAL_TOKEN_PATTERN = re.compile(r"<\|\S+?\|>")
 
 # Leaked reasoning artifacts that should never appear in content.
 # The model sometimes outputs </thinking> instead of </think>, and if
