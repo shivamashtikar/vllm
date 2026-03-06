@@ -741,7 +741,11 @@ def _min_latency_fused_qkv_a_proj_impl(
         ops.dsv3_fused_a_gemm(output, input_, weight.T)
         return output
     else:
-        return torch.nn.functional.linear(input_, weight)
+        # Ensure contiguous tensors to avoid CUBLAS errors with
+        # non-contiguous strides from torch.compile/inductor
+        return torch.nn.functional.linear(
+            input_.contiguous(), weight.contiguous()
+        )
 
 
 def _min_latency_fused_qkv_a_proj_fake(
