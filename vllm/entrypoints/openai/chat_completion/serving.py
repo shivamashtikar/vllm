@@ -68,10 +68,10 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
 from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
 from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.inputs.data import EmbedsPrompt, TokensPrompt
-from vllm.inputs.parse import get_prompt_components
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.parser import ParserManager
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.mistral import (
@@ -87,6 +87,73 @@ from vllm.utils.collection_utils import as_list
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
 
 logger = init_logger(__name__)
+
+
+class MalformedToolCallError(Exception):
+    """Raised when the model produces degenerate output such as
+    hallucinated tool-call-like text in the reasoning block without
+    ever closing the think block."""
+    pass
+
+
+class MalformedReasoningError(Exception):
+    """Raised when the model produces degenerate output containing
+    special tokens (e.g. <|...|>) that leaked into reasoning or
+    content text, or when reasoning artifacts like </thinking>
+    appear in content."""
+    pass
+
+
+# Minimum number of hallucinated tool-call pattern occurrences in reasoning
+# before triggering a failure. A single occurrence could be legitimate (the
+# model discussing tool calls in its thinking). 3+ repetitions is a clear
+# signal of degenerate output where the model dropped the </think> tag and
+# is looping on hallucinated tool-call-like text.
+_HALLUCINATED_TOOL_CALL_THRESHOLD = 3
+_HALLUCINATED_TOOL_CALL_MARKER = "<function_calls>"
+
+# Regex pattern to detect special tokens like <|...|> in text.
+# These are model-internal control tokens that should never appear in
+# reasoning or content output. A single occurrence is always degenerate.
+# Uses \S+? (non-greedy, non-whitespace) to avoid matching the bare <|>
+# operator (e.g. Haskell's alternative operator) or greedily spanning
+# across unrelated text between two <|> occurrences.
+_SPECIAL_TOKEN_PATTERN = re.compile(r"<\|\S+?\|>")
+
+# Leaked reasoning artifacts that should never appear in content.
+# The model sometimes outputs </thinking> instead of </think>, and if
+# the reasoning parser doesn't catch it (e.g. token not in vocab), it
+# leaks into content as literal text.
+_LEAKED_REASONING_MARKER = "</thinking>"
+
+
+def _detect_hallucinated_tool_calls_in_reasoning(
+    reasoning: str,
+    threshold: int = _HALLUCINATED_TOOL_CALL_THRESHOLD,
+) -> bool:
+    """Check if accumulated reasoning contains repeated hallucinated
+    tool-call patterns, indicating the model is stuck generating
+    degenerate output without ever closing the think block.
+
+    Returns True if the hallucinated pattern count meets or exceeds
+    the threshold.
+    """
+    count = reasoning.count(_HALLUCINATED_TOOL_CALL_MARKER)
+    return count >= threshold
+
+
+def _detect_special_tokens_in_text(text: str) -> str | None:
+    """Check if text contains any special tokens matching <|...|> pattern.
+
+    These are model-internal control tokens (e.g. <|im_end|>,
+    <|tool_call_begin|>) that should never appear in reasoning or
+    content output. Their presence indicates the model is producing
+    degenerate output.
+
+    Returns the matched token string if found, None otherwise.
+    """
+    match = _SPECIAL_TOKEN_PATTERN.search(text)
+    return match.group(0) if match else None
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -132,13 +199,15 @@ class OpenAIServingChat(OpenAIServing):
         self.logits_processors = self.model_config.logits_processors
 
         # set up reasoning parser
-        self.reasoning_parser = self._get_reasoning_parser(
+        self.reasoning_parser = ParserManager.get_reasoning_parser(
             reasoning_parser_name=reasoning_parser
         )
         # set up tool use
         self.enable_auto_tools: bool = enable_auto_tools
-        self.tool_parser = self._get_tool_parser(
-            tool_parser_name=tool_parser, enable_auto_tools=enable_auto_tools
+        self.tool_parser = ParserManager.get_tool_parser(
+            tool_parser_name=tool_parser,
+            enable_auto_tools=enable_auto_tools,
+            model_name=self.model_config.model,
         )
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
 
@@ -359,7 +428,7 @@ class OpenAIServingChat(OpenAIServing):
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
             for i, engine_prompt in enumerate(engine_prompts):
-                prompt_text, _, _ = get_prompt_components(engine_prompt)
+                prompt_text = engine_prompt.get("prompt")
 
                 # If we are creating sub requests for multiple prompts, ensure that they
                 # have unique request ids.
@@ -677,8 +746,15 @@ class OpenAIServingChat(OpenAIServing):
             # For reasoning parser and tool call all enabled
             added_content_delta_arr = [False] * num_choices
             reasoning_end_arr = [False] * num_choices
+            prompt_is_reasoning_end_arr: list[bool | None] = [None] * num_choices
+            # Track accumulated reasoning for fallback copy to content
+            accumulated_reasoning_arr: list[str] = [""] * num_choices
+            # Track if any content has been streamed
+            seen_content_arr: list[bool] = [False] * num_choices
         else:
             all_previous_token_ids = None
+            accumulated_reasoning_arr = None
+            seen_content_arr = None
 
         try:
             if self.reasoning_parser:
@@ -822,6 +898,16 @@ class OpenAIServingChat(OpenAIServing):
                     i = output.index
                     tool_parser = tool_parsers[i]
 
+                    if (
+                        self.reasoning_parser
+                        and res.prompt_token_ids
+                        and prompt_is_reasoning_end_arr[i] is None
+                    ):
+                        # only check once per choice, because prompt_token_ids
+                        # are the same for all deltas in that choice
+                        prompt_is_reasoning_end_arr[i] = (
+                            reasoning_parser.is_reasoning_end(res.prompt_token_ids)
+                        )
                     if finish_reason_sent[i]:
                         continue
 
@@ -924,13 +1010,11 @@ class OpenAIServingChat(OpenAIServing):
                             # i.e {"enable_thinking": False},
                             # set reasoning status to end.
                             # Only keep 'content', remove 'reasoning'.
-                            if reasoning_parser.is_reasoning_end(
-                                as_list(output.token_ids)
-                            ) or (
-                                res.prompt_token_ids
-                                and reasoning_parser.is_reasoning_end(
-                                    res.prompt_token_ids
+                            if (
+                                reasoning_parser.is_reasoning_end(
+                                    as_list(output.token_ids)
                                 )
+                                or prompt_is_reasoning_end_arr[i]
                             ):
                                 reasoning_end_arr[i] = True
                                 if delta_message and delta_message.content:
@@ -989,8 +1073,7 @@ class OpenAIServingChat(OpenAIServing):
                         if (
                             self.reasoning_parser is not None
                             and not reasoning_end_arr[i]
-                            and res.prompt_token_ids
-                            and reasoning_parser.is_reasoning_end(res.prompt_token_ids)
+                            and prompt_is_reasoning_end_arr[i]
                         ):
                             reasoning_end_arr[i] = True
 
@@ -1047,12 +1130,7 @@ class OpenAIServingChat(OpenAIServing):
                             # When encountering think end id in prompt_token_ids
                             # i.e {"enable_thinking": False},
                             # set reasoning status to end.
-                            if (
-                                res.prompt_token_ids
-                                and reasoning_parser.is_reasoning_end(
-                                    res.prompt_token_ids
-                                )
-                            ):
+                            if prompt_is_reasoning_end_arr[i]:
                                 reasoning_end_arr[i] = True
                                 current_token_ids = output_token_ids
                                 # Don't update current_text, keep it as is from delta
@@ -1134,6 +1212,35 @@ class OpenAIServingChat(OpenAIServing):
                             current_token_ids,
                             output.token_ids,
                         )
+                        
+                        # Check if reasoning has ended (e.g., </think> token seen)
+                        # This handles the case where the end token is a single
+                        # token and extract_reasoning_streaming returns None
+                        if (
+                            not reasoning_end_arr[i]
+                            and reasoning_parser.is_reasoning_end(
+                                as_list(output.token_ids)
+                            )
+                        ):
+                            reasoning_end_arr[i] = True
+                            # If content was extracted, mark it as seen
+                            if delta_message and delta_message.content:
+                                seen_content_arr[i] = True
+
+                        # After reasoning ends, subsequent deltas should be
+                        # content, not reasoning. Convert reasoning delta to
+                        # content delta since we're past </think>
+                        if (
+                            reasoning_end_arr[i]
+                            and delta_message
+                            and delta_message.reasoning
+                            and not delta_message.content
+                        ):
+                            delta_message.content = delta_message.reasoning
+                            delta_message.reasoning = None
+                            if seen_content_arr is not None:
+                                seen_content_arr[i] = True
+
                     # handle streaming just a content delta
                     else:
                         delta_message = DeltaMessage(content=delta_text)
@@ -1168,6 +1275,82 @@ class OpenAIServingChat(OpenAIServing):
                         ):
                             continue
                         delta_message = DeltaMessage()
+
+                    # Track reasoning and content for fallback copy
+                    if self.reasoning_parser and delta_message is not None:
+                        if (
+                            accumulated_reasoning_arr is not None
+                            and delta_message.reasoning
+                        ):
+                            accumulated_reasoning_arr[i] += delta_message.reasoning
+
+                            # Detect hallucinated tool-call patterns in
+                            # reasoning. If the model is stuck generating
+                            # degenerate tool-call-like text inside the
+                            # think block (without ever closing </think>),
+                            # abort early with a 5XX error.
+                            if (
+                                not reasoning_end_arr[i]
+                                and tool_choice_auto
+                                and _detect_hallucinated_tool_calls_in_reasoning(
+                                    accumulated_reasoning_arr[i]
+                                )
+                            ):
+                                raise MalformedToolCallError(
+                                    "Model produced degenerate output: "
+                                    "repeated hallucinated tool-call "
+                                    "patterns detected in reasoning "
+                                    "content without closing the think "
+                                    "block. The model is likely stuck in "
+                                    "a loop generating malformed tool "
+                                    "call text."
+                                )
+
+                            # Detect special tokens (<|...|>) leaked
+                            # into reasoning text. Any single occurrence
+                            # is degenerate — these are model-internal
+                            # control tokens that should never appear in
+                            # output text.
+                            leaked_token = _detect_special_tokens_in_text(
+                                delta_message.reasoning
+                            )
+                            if leaked_token:
+                                raise MalformedReasoningError(
+                                    f"Model produced degenerate output: "
+                                    f"special token {leaked_token!r} "
+                                    f"detected in reasoning content. "
+                                    f"This indicates the model is "
+                                    f"generating malformed output with "
+                                    f"leaked control tokens."
+                                )
+
+                        if seen_content_arr is not None and delta_message.content:
+                            seen_content_arr[i] = True
+
+                        # Detect special tokens (<|...|>) or leaked
+                        # reasoning artifacts (</thinking>) in content
+                        # text during streaming.
+                        if delta_message.content:
+                            leaked_token = _detect_special_tokens_in_text(
+                                delta_message.content
+                            )
+                            if leaked_token:
+                                raise MalformedReasoningError(
+                                    f"Model produced degenerate output: "
+                                    f"special token {leaked_token!r} "
+                                    f"detected in content. This indicates "
+                                    f"the model is generating malformed "
+                                    f"output with leaked control tokens."
+                                )
+                            if _LEAKED_REASONING_MARKER in delta_message.content:
+                                raise MalformedReasoningError(
+                                    "Model produced degenerate output: "
+                                    "reasoning artifact '</thinking>' "
+                                    "detected in content. This indicates "
+                                    "the model leaked its internal "
+                                    "reasoning structure into the "
+                                    "response."
+                                )
 
                     # Log streaming delta if output logging is enabled
                     if self.enable_log_outputs and self.request_logger:
@@ -1272,6 +1455,27 @@ class OpenAIServingChat(OpenAIServing):
                             delta_message = self._create_remaining_args_delta(
                                 delta_message, remaining_call, index
                             )
+
+                        # If no content was ever sent, no tools were called,
+                        # and we have accumulated reasoning, set content to
+                        # reasoning for the final chunk. This handles the case
+                        # where the model generates reasoning without a closing
+                        # </think> tag, putting all output in reasoning.
+                        if (
+                            self.reasoning_parser
+                            and accumulated_reasoning_arr is not None
+                            and seen_content_arr is not None
+                            and not seen_content_arr[i]
+                            and not tools_streamed[i]
+                            and not (self.use_harmony and harmony_tools_streamed[i])
+                            and not auto_tools_called
+                            and accumulated_reasoning_arr[i]
+                        ):
+                            # Copy accumulated reasoning to content
+                            if delta_message is None:
+                                delta_message = DeltaMessage()
+                            delta_message.content = accumulated_reasoning_arr[i]
+                            seen_content_arr[i] = True  # Prevent re-emission
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
@@ -1379,6 +1583,32 @@ class OpenAIServingChat(OpenAIServing):
 
         except GenerationError as e:
             yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
+        except MalformedToolCallError as e:
+            from http import HTTPStatus
+            logger.error(
+                "Malformed tool call detected for request %s: %s",
+                request_id,
+                str(e),
+            )
+            data = self.create_streaming_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            yield f"data: {data}\n\n"
+        except MalformedReasoningError as e:
+            from http import HTTPStatus
+            logger.error(
+                "Malformed reasoning detected for request %s: %s",
+                request_id,
+                str(e),
+            )
+            data = self.create_streaming_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            yield f"data: {data}\n\n"
         except Exception as e:
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
@@ -1529,6 +1759,71 @@ class OpenAIServingChat(OpenAIServing):
                 enable_auto_tools=self.enable_auto_tools,
                 tool_parser_cls=self.tool_parser,
             )
+
+            # Detect hallucinated tool-call patterns in reasoning content.
+            # If the model generated degenerate tool-call-like text inside
+            # the think block without ever closing </think>, and the request
+            # had tools configured, fail with 5XX instead of serving garbage.
+            if (
+                not content  # content is None (reasoning never ended)
+                and reasoning  # reasoning has content
+                and self.tool_parser  # tools were configured
+                and self.enable_auto_tools
+                and _detect_hallucinated_tool_calls_in_reasoning(reasoning)
+            ):
+                from http import HTTPStatus
+                logger.error(
+                    "Malformed tool call detected for request %s: "
+                    "repeated hallucinated tool-call patterns found in "
+                    "reasoning content without closing the think block.",
+                    request_id,
+                )
+                return self.create_error_response(
+                    "Model produced degenerate output: repeated "
+                    "hallucinated tool-call patterns detected in "
+                    "reasoning content without closing the think "
+                    "block. The model is likely stuck in a loop "
+                    "generating malformed tool call text.",
+                    err_type="InternalServerError",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+
+            # Detect special tokens (<|...|>) leaked into reasoning.
+            # Any occurrence is degenerate — these are model-internal
+            # control tokens that should never appear in output text.
+            if reasoning:
+                leaked_token = _detect_special_tokens_in_text(reasoning)
+                if leaked_token:
+                    from http import HTTPStatus
+                    logger.error(
+                        "Special token leak detected for request %s: "
+                        "token %r found in reasoning content.",
+                        request_id,
+                        leaked_token,
+                    )
+                    return self.create_error_response(
+                        f"Model produced degenerate output: special "
+                        f"token {leaked_token!r} detected in reasoning "
+                        f"content. This indicates the model is "
+                        f"generating malformed output with leaked "
+                        f"control tokens.",
+                        err_type="InternalServerError",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+
+            # Copy reasoning to content if:
+            # - content is None or empty
+            # - reasoning has actual content
+            # - no tool calls were detected
+            # This handles the case where the model generates reasoning
+            # without a closing </think> tag, putting all output in reasoning.
+            if (
+                not content  # content is None or empty string
+                and reasoning  # reasoning has actual content
+                and not tool_calls  # no tool calls
+            ):
+                content = reasoning
+
             tool_call_class = (
                 MistralToolCall if isinstance(tokenizer, MistralTokenizer) else ToolCall
             )
