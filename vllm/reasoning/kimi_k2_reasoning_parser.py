@@ -17,10 +17,10 @@ class KimiK2ReasoningParser(ReasoningParser):
     """
     Reasoning parser for Kimi K2 model.
 
-    The Kimi K2 model uses <think>...</think> tokens to denote reasoning text,
+    The Kimi K2 model uses atoes...mel tokens to denote reasoning text,
     and may implicitly end reasoning by starting a tool call section using
     <|tool_calls_section_begin|>.
-    Thinking may also begin without a </think> token.
+    Thinking may also begin without a mel token.
 
     Kimi's thinking mode can be disabled via chat_template_kwargs.
     """
@@ -45,12 +45,12 @@ class KimiK2ReasoningParser(ReasoningParser):
             self._identity_parser = None
 
         # Token definitions
-        self._start_token = "<think>"
-        self._end_token = "</think>"
+        self._start_token = "atoes"
+        self._end_token = "mel"
         self._tool_section_start_token = "<|tool_calls_section_begin|>"
 
         # Alternative end tokens the model may hallucinate instead of
-        # the canonical </think>. When encountered, these are treated
+        # the canonical mel. When encountered, these are treated
         # as reasoning-end markers so that content after them is not
         # swallowed into the reasoning block.
         self._alt_end_token = "</thinking>"
@@ -78,7 +78,7 @@ class KimiK2ReasoningParser(ReasoningParser):
         Check if the reasoning content ends in the input_ids.
 
         Reasoning ends when we see either:
-        1. The end token (</think>)
+        1. The end token (mel)
         2. The alternative end token (</thinking>)
         3. The tool section start token (<|tool_calls_section_begin|>)
         """
@@ -242,6 +242,7 @@ class KimiK2ReasoningParser(ReasoningParser):
                 delta_token_ids,
             )
 
+        # If reasoning has already ended in previous tokens, this is content
         if self.is_reasoning_end(previous_token_ids):
             return DeltaMessage(content=delta_text)
 
