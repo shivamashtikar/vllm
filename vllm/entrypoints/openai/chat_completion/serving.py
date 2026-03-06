@@ -1275,7 +1275,7 @@ class OpenAIServingChat(OpenAIServing):
                         delta_message = DeltaMessage()
 
                     # Track reasoning and content for fallback copy
-                    if self.reasoning_parser and delta_message is not None:
+                    if reasoning_parser and delta_message is not None:
                         if (
                             accumulated_reasoning_arr is not None
                             and delta_message.reasoning
@@ -1460,7 +1460,7 @@ class OpenAIServingChat(OpenAIServing):
                         # where the model generates reasoning without a closing
                         # </think> tag, putting all output in reasoning.
                         if (
-                            self.reasoning_parser
+                            reasoning_parser
                             and accumulated_reasoning_arr is not None
                             and seen_content_arr is not None
                             and not seen_content_arr[i]
