@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import re
 from collections.abc import Sequence
 
 from transformers import PreTrainedTokenizerBase
@@ -11,6 +12,16 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
+
+# Pattern to match tool-related special tokens that are part of Kimi K2's
+# tool call format. These tokens are expected in model output when the model
+# generates tool calls (even without tools in the request) and should be
+# stripped from content rather than treated as degenerate output.
+_TOOL_SPECIAL_TOKEN_PATTERN = re.compile(
+    r"<\|tool_calls?_section_(?:begin|end)\|>"
+    r"|<\|tool_call_(?:begin|end)\|>"
+    r"|<\|tool_call_argument_begin\|>"
+)
 
 
 class KimiK2ReasoningParser(ReasoningParser):
@@ -62,6 +73,11 @@ class KimiK2ReasoningParser(ReasoningParser):
             self._tool_section_start_token
         )
         self._alt_end_token_id = self.vocab.get(self._alt_end_token)
+
+        # Track whether reasoning ended via tool section start token.
+        # When True, the parser is in "tool section passthrough" mode
+        # where tool-related special tokens are stripped from content.
+        self._in_tool_section = False
 
         if self._start_token_id is None or self._end_token_id is None:
             raise RuntimeError(
@@ -209,6 +225,9 @@ class KimiK2ReasoningParser(ReasoningParser):
 
         tool_section_index = model_output.find(self._tool_section_start_token)
         if tool_section_index != -1:
+            # Keep the tool section start token in content for non-streaming
+            # path — the tool parser's extract_tool_calls() needs it to
+            # detect tool calls via text matching.
             return (
                 model_output[start_token_index:tool_section_index],
                 model_output[tool_section_index:] or None,
@@ -243,6 +262,13 @@ class KimiK2ReasoningParser(ReasoningParser):
             )
 
         if self.is_reasoning_end(previous_token_ids):
+            # If we're in tool section mode (reasoning ended via tool
+            # section start token), strip tool-related special tokens
+            # from content to prevent the degenerate output detector
+            # from flagging them as leaked control tokens.
+            if self._in_tool_section:
+                content = _TOOL_SPECIAL_TOKEN_PATTERN.sub("", delta_text)
+                return DeltaMessage(content=content if content else None)
             return DeltaMessage(content=delta_text)
 
         # Skip single special tokens
@@ -276,8 +302,19 @@ class KimiK2ReasoningParser(ReasoningParser):
         if self._tool_section_start_token_id in delta_token_ids:
             tool_index = delta_text.find(self._tool_section_start_token)
             reasoning = delta_text[:tool_index]
-            content = delta_text[tool_index:]
-            return DeltaMessage(reasoning=reasoning, content=content)
+            # Strip the tool section start token from content, consistent
+            # with how </think> and </thinking> end tokens are stripped.
+            # The token is a control marker, not user-visible content.
+            content = delta_text[
+                tool_index + len(self._tool_section_start_token) :
+            ]
+            # Enter tool section mode so subsequent deltas also have
+            # tool tokens stripped (handles the reasoning-only path
+            # where no tool parser is active).
+            self._in_tool_section = True
+            return DeltaMessage(
+                reasoning=reasoning, content=content if content else None
+            )
 
         # still reasoning (no end token)
         return DeltaMessage(reasoning=delta_text)
