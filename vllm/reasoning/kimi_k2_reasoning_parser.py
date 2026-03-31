@@ -74,11 +74,6 @@ class KimiK2ReasoningParser(ReasoningParser):
         )
         self._alt_end_token_id = self.vocab.get(self._alt_end_token)
 
-        # Track whether reasoning ended via tool section start token.
-        # When True, the parser is in "tool section passthrough" mode
-        # where tool-related special tokens are stripped from content.
-        self._in_tool_section = False
-
         if self._start_token_id is None or self._end_token_id is None:
             raise RuntimeError(
                 "KimiK2ReasoningParser could not locate think start/end "
@@ -262,14 +257,13 @@ class KimiK2ReasoningParser(ReasoningParser):
             )
 
         if self.is_reasoning_end(previous_token_ids):
-            # If we're in tool section mode (reasoning ended via tool
-            # section start token), strip tool-related special tokens
-            # from content to prevent the degenerate output detector
-            # from flagging them as leaked control tokens.
-            if self._in_tool_section:
-                content = _TOOL_SPECIAL_TOKEN_PATTERN.sub("", delta_text)
-                return DeltaMessage(content=content if content else None)
-            return DeltaMessage(content=delta_text)
+            # Strip tool-related special tokens from content to prevent
+            # the degenerate output detector from flagging them as
+            # leaked control tokens. The model may generate tool call
+            # tokens after reasoning ends via </think> or via
+            # <|tool_calls_section_begin|> — both cases need stripping.
+            content = _TOOL_SPECIAL_TOKEN_PATTERN.sub("", delta_text)
+            return DeltaMessage(content=content if content else None)
 
         # Skip single special tokens
         skip_token_ids = [self._start_token_id, self._end_token_id]
@@ -308,10 +302,6 @@ class KimiK2ReasoningParser(ReasoningParser):
             content = delta_text[
                 tool_index + len(self._tool_section_start_token) :
             ]
-            # Enter tool section mode so subsequent deltas also have
-            # tool tokens stripped (handles the reasoning-only path
-            # where no tool parser is active).
-            self._in_tool_section = True
             return DeltaMessage(
                 reasoning=reasoning, content=content if content else None
             )
