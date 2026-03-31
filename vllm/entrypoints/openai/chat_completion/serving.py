@@ -1315,6 +1315,30 @@ class OpenAIServingChat(OpenAIServing):
                                 delta_message.reasoning
                             )
                             if leaked_token:
+                                logger.error(
+                                    "Degenerate reasoning for request %s:\n"
+                                    "  leaked_token=%r\n"
+                                    "  delta_text=%r\n"
+                                    "  delta_message.reasoning=%r\n"
+                                    "  delta_message.content=%r\n"
+                                    "  previous_text=%r\n"
+                                    "  current_text=%r\n"
+                                    "  raw_output_text=%r\n"
+                                    "  delta_token_ids=%s\n"
+                                    "  reasoning_end=%s\n"
+                                    "  tool_choice_auto=%s",
+                                    request_id,
+                                    leaked_token,
+                                    delta_text,
+                                    delta_message.reasoning,
+                                    delta_message.content,
+                                    previous_text,
+                                    current_text,
+                                    output.text,
+                                    list(output.token_ids) if output.token_ids else [],
+                                    reasoning_end_arr[i],
+                                    tool_choice_auto,
+                                )
                                 raise MalformedReasoningError(
                                     f"Model produced degenerate output: "
                                     f"special token {leaked_token!r} "
@@ -1335,6 +1359,30 @@ class OpenAIServingChat(OpenAIServing):
                                 delta_message.content
                             )
                             if leaked_token:
+                                logger.error(
+                                    "Degenerate content for request %s:\n"
+                                    "  leaked_token=%r\n"
+                                    "  delta_text=%r\n"
+                                    "  delta_message.reasoning=%r\n"
+                                    "  delta_message.content=%r\n"
+                                    "  previous_text=%r\n"
+                                    "  current_text=%r\n"
+                                    "  raw_output_text=%r\n"
+                                    "  delta_token_ids=%s\n"
+                                    "  reasoning_end=%s\n"
+                                    "  tool_choice_auto=%s",
+                                    request_id,
+                                    leaked_token,
+                                    delta_text,
+                                    delta_message.reasoning,
+                                    delta_message.content,
+                                    previous_text,
+                                    current_text,
+                                    output.text,
+                                    list(output.token_ids) if output.token_ids else [],
+                                    reasoning_end_arr[i],
+                                    tool_choice_auto,
+                                )
                                 raise MalformedReasoningError(
                                     f"Model produced degenerate output: "
                                     f"special token {leaked_token!r} "
