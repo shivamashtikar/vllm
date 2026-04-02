@@ -80,6 +80,32 @@ class KimiK2ReasoningParser(ReasoningParser):
             content = content[:idx]
         return content if content else None
 
+    def _reasoning_end_type(self, input_ids: Sequence[int]) -> str | None:
+        """Return how reasoning ended: 'think', 'tool', or None.
+
+        Scans backward from the end of input_ids. The most recent
+        marker determines the current state:
+        - </think> or </thinking> → 'think' (explicit reasoning end)
+        - <|tool_calls_section_begin|> → 'tool' (in tool section)
+        - <think> found before any end marker → None (still reasoning)
+        """
+        for i in range(len(input_ids) - 1, -1, -1):
+            if input_ids[i] == self._start_token_id:
+                return None
+            if input_ids[i] == self._end_token_id:
+                return "think"
+            if (
+                self._alt_end_token_id is not None
+                and input_ids[i] == self._alt_end_token_id
+            ):
+                return "think"
+            if (
+                self._tool_section_start_token_id is not None
+                and input_ids[i] == self._tool_section_start_token_id
+            ):
+                return "tool"
+        return None
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """
         Check if the reasoning content ends in the input_ids.
@@ -91,30 +117,7 @@ class KimiK2ReasoningParser(ReasoningParser):
         """
         if self._is_identity_mode():
             return self._identity_parser.is_reasoning_end(input_ids)
-
-        start_token_id = self._start_token_id
-        end_token_id = self._end_token_id
-        alt_end_token_id = self._alt_end_token_id
-        tool_section_start_token_id = self._tool_section_start_token_id
-
-        for i in range(len(input_ids) - 1, -1, -1):
-            if input_ids[i] == start_token_id:
-                return False
-            if input_ids[i] == end_token_id:
-                return True
-            # Alternative end token (</thinking>)
-            if (
-                alt_end_token_id is not None
-                and input_ids[i] == alt_end_token_id
-            ):
-                return True
-            # Implicit reasoning end via tool call section
-            if (
-                tool_section_start_token_id is not None
-                and input_ids[i] == tool_section_start_token_id
-            ):
-                return True
-        return False
+        return self._reasoning_end_type(input_ids) is not None
 
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Sequence[int]
@@ -252,10 +255,12 @@ class KimiK2ReasoningParser(ReasoningParser):
                 delta_token_ids,
             )
 
-        if self.is_reasoning_end(previous_token_ids):
-            # Reasoning already ended in a prior delta. Trim content at
-            # the first tool token boundary — everything from a tool
-            # control token onwards is tool call data, not user content.
+        end_type = self._reasoning_end_type(previous_token_ids)
+        if end_type is not None:
+            if end_type == "tool":
+                # In tool section — suppress all content
+                return DeltaMessage(content=None)
+            # "think" — legitimate content after </think>
             content = self._trim_at_tool_boundary(delta_text)
             return DeltaMessage(content=content)
 
@@ -289,14 +294,8 @@ class KimiK2ReasoningParser(ReasoningParser):
 
         if self._tool_section_start_token_id in delta_token_ids:
             tool_index = delta_text.find(self._tool_section_start_token)
-            reasoning = delta_text[:tool_index]
-            # Everything from the tool section start token onwards is
-            # tool call data — trim it all from content.
-            content = delta_text[
-                tool_index + len(self._tool_section_start_token) :
-            ]
-            content = self._trim_at_tool_boundary(content) if content else None
-            return DeltaMessage(reasoning=reasoning, content=content)
+            reasoning = delta_text[:tool_index] or None
+            return DeltaMessage(reasoning=reasoning, content=None)
 
         # still reasoning (no end token)
         return DeltaMessage(reasoning=delta_text)
