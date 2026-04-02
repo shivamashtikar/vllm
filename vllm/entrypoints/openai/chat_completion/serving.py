@@ -426,12 +426,6 @@ class OpenAIServingChat(OpenAIServing):
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
         )
 
-        logger.info(
-            "Chat completion request %s: %s",
-            request_id,
-            request.model_dump_json(exclude_none=True),
-        )
-
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
             raw_request.state.request_metadata = request_metadata
