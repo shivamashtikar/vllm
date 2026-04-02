@@ -112,6 +112,13 @@ class MalformedReasoningError(Exception):
 _HALLUCINATED_TOOL_CALL_THRESHOLD = 3
 _HALLUCINATED_TOOL_CALL_MARKER = "<function_calls>"
 
+# Anthropic-style tool call pattern that the model sometimes hallucinates
+# instead of using Kimi's native <|tool_call_begin|> format.
+# e.g. [tool_use:toolu_PJqlFKX_UYuFEfjrJkkPAE5U:Read]
+_HALLUCINATED_ANTHROPIC_TOOL_PATTERN = re.compile(
+    r"\[tool_use:toolu_\w+:\w+\]"
+)
+
 # Regex pattern to detect special tokens like <|...|> in text.
 # These are model-internal control tokens that should never appear in
 # reasoning or content output. A single occurrence is always degenerate.
@@ -140,6 +147,18 @@ def _detect_hallucinated_tool_calls_in_reasoning(
     """
     count = reasoning.count(_HALLUCINATED_TOOL_CALL_MARKER)
     return count >= threshold
+
+
+def _detect_anthropic_tool_pattern(text: str) -> str | None:
+    """Check if text contains Anthropic-style hallucinated tool call patterns.
+
+    The model sometimes generates [tool_use:toolu_<id>:<name>] instead of
+    using Kimi's native tool call format. Any occurrence is degenerate.
+
+    Returns the matched pattern string if found, None otherwise.
+    """
+    match = _HALLUCINATED_ANTHROPIC_TOOL_PATTERN.search(text)
+    return match.group(0) if match else None
 
 
 def _detect_special_tokens_in_text(text: str) -> str | None:
@@ -1306,6 +1325,28 @@ class OpenAIServingChat(OpenAIServing):
                                     "call text."
                                 )
 
+                            # Detect Anthropic-style hallucinated tool
+                            # call patterns in reasoning (e.g.
+                            # [tool_use:toolu_xxx:Read]).
+                            anthropic_tool = _detect_anthropic_tool_pattern(
+                                delta_message.reasoning
+                            )
+                            if anthropic_tool:
+                                logger.error(
+                                    "Anthropic-style tool call in "
+                                    "reasoning for request %s: %r",
+                                    request_id,
+                                    anthropic_tool,
+                                )
+                                raise MalformedToolCallError(
+                                    f"Model produced degenerate output: "
+                                    f"Anthropic-style tool call pattern "
+                                    f"{anthropic_tool!r} detected in "
+                                    f"reasoning. The model is "
+                                    f"hallucinating tool calls in a "
+                                    f"foreign format."
+                                )
+
                             # Detect special tokens (<|...|>) leaked
                             # into reasoning text. Any single occurrence
                             # is degenerate — these are model-internal
@@ -1398,6 +1439,24 @@ class OpenAIServingChat(OpenAIServing):
                                     "the model leaked its internal "
                                     "reasoning structure into the "
                                     "response."
+                                )
+                            anthropic_tool = _detect_anthropic_tool_pattern(
+                                delta_message.content
+                            )
+                            if anthropic_tool:
+                                logger.error(
+                                    "Anthropic-style tool call in "
+                                    "content for request %s: %r",
+                                    request_id,
+                                    anthropic_tool,
+                                )
+                                raise MalformedToolCallError(
+                                    f"Model produced degenerate output: "
+                                    f"Anthropic-style tool call pattern "
+                                    f"{anthropic_tool!r} detected in "
+                                    f"content. The model is "
+                                    f"hallucinating tool calls in a "
+                                    f"foreign format."
                                 )
 
                     # Log streaming delta if output logging is enabled
@@ -1835,6 +1894,25 @@ class OpenAIServingChat(OpenAIServing):
                     err_type="InternalServerError",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
+
+            # Detect Anthropic-style hallucinated tool calls in reasoning.
+            if reasoning:
+                anthropic_tool = _detect_anthropic_tool_pattern(reasoning)
+                if anthropic_tool:
+                    from http import HTTPStatus
+                    logger.error(
+                        "Anthropic-style tool call detected for "
+                        "request %s: %r in reasoning.",
+                        request_id,
+                        anthropic_tool,
+                    )
+                    return self.create_error_response(
+                        f"Model produced degenerate output: "
+                        f"Anthropic-style tool call pattern "
+                        f"{anthropic_tool!r} detected in reasoning.",
+                        err_type="InternalServerError",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
 
             # Detect special tokens (<|...|>) leaked into reasoning.
             # Any occurrence is degenerate — these are model-internal
