@@ -52,12 +52,19 @@ class KimiK2ReasoningParser(ReasoningParser):
         self._end_token = "</think>"
         self._tool_section_start_token = "<|tool_calls_section_begin|>"
 
+        # Alternative end tokens the model may hallucinate instead of
+        # the canonical </think>. When encountered, these are treated
+        # as reasoning-end markers so that content after them is not
+        # swallowed into the reasoning block.
+        self._alt_end_token = "</thinking>"
+
         # Get token IDs
         self._start_token_id = self.vocab.get(self._start_token)
         self._end_token_id = self.vocab.get(self._end_token)
         self._tool_section_start_token_id = self.vocab.get(
             self._tool_section_start_token
         )
+        self._alt_end_token_id = self.vocab.get(self._alt_end_token)
 
         if self._start_token_id is None or self._end_token_id is None:
             raise RuntimeError(
@@ -65,33 +72,51 @@ class KimiK2ReasoningParser(ReasoningParser):
                 "tokens in the tokenizer!"
             )
 
+    def _trim_at_tool_boundary(self, content: str) -> str | None:
+        """Trim content at the tool section start boundary."""
+        idx = content.find(self._tool_section_start_token)
+        if idx != -1:
+            content = content[:idx]
+        return content if content else None
+
+    def _reasoning_end_type(self, input_ids: Sequence[int]) -> str | None:
+        """Return how reasoning ended: 'think', 'tool', or None.
+
+        Scans backward from the end of input_ids. The most recent
+        marker determines the current state:
+        - </think> or </thinking> → 'think' (explicit reasoning end)
+        - <|tool_calls_section_begin|> → 'tool' (in tool section)
+        - <think> found before any end marker → None (still reasoning)
+        """
+        for i in range(len(input_ids) - 1, -1, -1):
+            if input_ids[i] == self._start_token_id:
+                return None
+            if input_ids[i] == self._end_token_id:
+                return "think"
+            if (
+                self._alt_end_token_id is not None
+                and input_ids[i] == self._alt_end_token_id
+            ):
+                return "think"
+            if (
+                self._tool_section_start_token_id is not None
+                and input_ids[i] == self._tool_section_start_token_id
+            ):
+                return "tool"
+        return None
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """
         Check if the reasoning content ends in the input_ids.
 
         Reasoning ends when we see either:
         1. The end token (</think>)
-        2. The tool section start token (<|tool_calls_section_begin|>)
+        2. The alternative end token (</thinking>)
+        3. The tool section start token (<|tool_calls_section_begin|>)
         """
         if self._identity_parser is not None:
             return self._identity_parser.is_reasoning_end(input_ids)
-
-        start_token_id = self._start_token_id
-        end_token_id = self._end_token_id
-        tool_section_start_token_id = self._tool_section_start_token_id
-
-        for i in range(len(input_ids) - 1, -1, -1):
-            if input_ids[i] == start_token_id:
-                return False
-            if input_ids[i] == end_token_id:
-                return True
-            # Implicit reasoning end via tool call section
-            if (
-                tool_section_start_token_id is not None
-                and input_ids[i] == tool_section_start_token_id
-            ):
-                return True
-        return False
+        return self._reasoning_end_type(input_ids) is not None
 
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]
@@ -109,6 +134,12 @@ class KimiK2ReasoningParser(ReasoningParser):
 
         # Check for explicit end token or implicit tool section start in delta
         if self._end_token_id in delta_ids_set:
+            return True
+        # Alternative end token (</thinking>)
+        if (
+            self._alt_end_token_id is not None
+            and self._alt_end_token_id in delta_ids_set
+        ):
             return True
         return (
             self._tool_section_start_token_id is not None
@@ -129,6 +160,20 @@ class KimiK2ReasoningParser(ReasoningParser):
 
             if end_token_index != -1:
                 return input_ids[end_token_index + 1 :]
+
+        # Alternative end token (</thinking>)
+        if (
+            self._alt_end_token_id is not None
+            and self._alt_end_token_id in input_ids
+        ):
+            alt_end_index = (
+                len(input_ids)
+                - 1
+                - input_ids[::-1].index(self._alt_end_token_id)
+            )
+
+            if alt_end_index != -1:
+                return input_ids[alt_end_index + 1 :]
 
         if (
             self._tool_section_start_token_id is not None
@@ -166,8 +211,19 @@ class KimiK2ReasoningParser(ReasoningParser):
                 model_output[end_token_index + len(self._end_token) :] or None,
             )
 
+        # Check for alternative end token (</thinking>)
+        alt_end_index = model_output.find(self._alt_end_token)
+        if alt_end_index != -1:
+            return (
+                model_output[start_token_index:alt_end_index],
+                model_output[alt_end_index + len(self._alt_end_token) :] or None,
+            )
+
         tool_section_index = model_output.find(self._tool_section_start_token)
         if tool_section_index != -1:
+            # Keep the tool section start token in content for non-streaming
+            # path — the tool parser's extract_tool_calls() needs it to
+            # detect tool calls via text matching.
             return (
                 model_output[start_token_index:tool_section_index],
                 model_output[tool_section_index:] or None,
@@ -201,30 +257,47 @@ class KimiK2ReasoningParser(ReasoningParser):
                 delta_token_ids,
             )
 
-        # If reasoning has already ended in previous tokens, this is content
-        if self.is_reasoning_end(previous_token_ids):
-            return DeltaMessage(content=delta_text)
+        end_type = self._reasoning_end_type(previous_token_ids)
+        if end_type is not None:
+            if end_type == "tool":
+                # In tool section — suppress all content
+                return DeltaMessage(content=None)
+            # "think" — legitimate content after </think>
+            content = self._trim_at_tool_boundary(delta_text)
+            return DeltaMessage(content=content)
 
         # Skip single special tokens
-        if len(delta_token_ids) == 1 and delta_token_ids[0] in [
-            self._start_token_id,
-            self._end_token_id,
-        ]:
+        skip_token_ids = [self._start_token_id, self._end_token_id]
+        if self._alt_end_token_id is not None:
+            skip_token_ids.append(self._alt_end_token_id)
+        if len(delta_token_ids) == 1 and delta_token_ids[0] in skip_token_ids:
             return None
 
         if self._end_token_id in delta_token_ids:
             end_index = delta_text.find(self._end_token)
             reasoning = delta_text[:end_index]
             content = delta_text[end_index + len(self._end_token) :]
-            return DeltaMessage(
-                reasoning=reasoning, content=content if content else None
-            )
+            content = self._trim_at_tool_boundary(content) if content else None
+            return DeltaMessage(reasoning=reasoning, content=content)
+
+        # Alternative end token (</thinking>) in delta
+        if (
+            self._alt_end_token_id is not None
+            and self._alt_end_token_id in delta_token_ids
+        ):
+            alt_end_index = delta_text.find(self._alt_end_token)
+            if alt_end_index != -1:
+                reasoning = delta_text[:alt_end_index]
+                content = delta_text[alt_end_index + len(self._alt_end_token) :]
+                content = (
+                    self._trim_at_tool_boundary(content) if content else None
+                )
+                return DeltaMessage(reasoning=reasoning, content=content)
 
         if self._tool_section_start_token_id in delta_token_ids:
             tool_index = delta_text.find(self._tool_section_start_token)
-            reasoning = delta_text[:tool_index]
-            content = delta_text[tool_index:]
-            return DeltaMessage(reasoning=reasoning, content=content)
+            reasoning = delta_text[:tool_index] or None
+            return DeltaMessage(reasoning=reasoning, content=None)
 
         # still reasoning (no end token)
         return DeltaMessage(reasoning=delta_text)
