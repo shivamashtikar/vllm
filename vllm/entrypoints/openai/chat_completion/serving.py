@@ -73,7 +73,10 @@ from vllm.reasoning import ReasoningParser
 from vllm.renderers import ChatParams
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
-from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
+from vllm.tool_parsers.mistral_tool_parser import (
+    MistralToolCall,
+    MistralToolParser,
+)
 from vllm.tool_parsers.utils import partial_json_loads
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer
@@ -82,6 +85,92 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
+
+class MalformedToolCallError(Exception):
+    """Raised when the model produces degenerate output such as
+    hallucinated tool-call-like text in the reasoning block without
+    ever closing the think block."""
+    pass
+
+
+class MalformedReasoningError(Exception):
+    """Raised when the model produces degenerate output containing
+    special tokens (e.g. <|...|>) that leaked into reasoning or
+    content text, or when reasoning artifacts like </thinking>
+    appear in content."""
+    pass
+
+
+# Minimum number of hallucinated tool-call pattern occurrences in reasoning
+# before triggering a failure. A single occurrence could be legitimate (the
+# model discussing tool calls in its thinking). 3+ repetitions is a clear
+# signal of degenerate output where the model dropped the </think> tag and
+# is looping on hallucinated tool-call-like text.
+_HALLUCINATED_TOOL_CALL_THRESHOLD = 3
+_HALLUCINATED_TOOL_CALL_MARKER = "<function_calls>"
+
+# Anthropic-style tool call pattern that the model sometimes hallucinates
+# instead of using Kimi's native <|tool_call_begin|> format.
+# e.g. [tool_use:toolu_PJqlFKX_UYuFEfjrJkkPAE5U:Read]
+_HALLUCINATED_ANTHROPIC_TOOL_PATTERN = re.compile(
+    r"\[tool_use:toolu_\w+:\w+\]"
+)
+
+# Regex pattern to detect special tokens like <|...|> in text.
+# These are model-internal control tokens that should never appear in
+# reasoning or content output. A single occurrence is always degenerate.
+# Uses \S+? (non-greedy, non-whitespace) to avoid matching the bare <|>
+# operator (e.g. Haskell's alternative operator) or greedily spanning
+# across unrelated text between two <|> occurrences.
+_SPECIAL_TOKEN_PATTERN = re.compile(r"<\|\S+?\|>")
+
+# Leaked reasoning artifacts that should never appear in content.
+# The model sometimes outputs </thinking> instead of </think>, and if
+# the reasoning parser doesn't catch it (e.g. token not in vocab), it
+# leaks into content as literal text.
+_LEAKED_REASONING_MARKER = "</thinking>"
+
+
+def _detect_hallucinated_tool_calls_in_reasoning(
+    reasoning: str,
+    threshold: int = _HALLUCINATED_TOOL_CALL_THRESHOLD,
+) -> bool:
+    """Check if accumulated reasoning contains repeated hallucinated
+    tool-call patterns, indicating the model is stuck generating
+    degenerate output without ever closing the think block.
+
+    Returns True if the hallucinated pattern count meets or exceeds
+    the threshold.
+    """
+    count = reasoning.count(_HALLUCINATED_TOOL_CALL_MARKER)
+    return count >= threshold
+
+
+def _detect_anthropic_tool_pattern(text: str) -> str | None:
+    """Check if text contains Anthropic-style hallucinated tool call patterns.
+
+    The model sometimes generates [tool_use:toolu_<id>:<name>] instead of
+    using Kimi's native tool call format. Any occurrence is degenerate.
+
+    Returns the matched pattern string if found, None otherwise.
+    """
+    match = _HALLUCINATED_ANTHROPIC_TOOL_PATTERN.search(text)
+    return match.group(0) if match else None
+
+
+def _detect_special_tokens_in_text(text: str) -> str | None:
+    """Check if text contains any special tokens matching <|...|> pattern.
+
+    These are model-internal control tokens (e.g. <|im_end|>,
+    <|tool_call_begin|>) that should never appear in reasoning or
+    content output. Their presence indicates the model is producing
+    degenerate output.
+
+    Returns the matched token string if found, None otherwise.
+    """
+    match = _SPECIAL_TOKEN_PATTERN.search(text)
+    return match.group(0) if match else None
+
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -140,6 +229,12 @@ class OpenAIServingChat(OpenAIServing):
             enable_auto_tools=enable_auto_tools,
             model_name=self.model_config.model,
         )
+        _is_mistral_tool_parser = self.tool_parser is not None and issubclass(
+            self.tool_parser, MistralToolParser
+        )
+        if _is_mistral_tool_parser and self.reasoning_parser_cls is not None:
+            MistralToolParser.model_can_reason = True
+
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
 
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
@@ -309,6 +404,11 @@ class OpenAIServingChat(OpenAIServing):
                 )
             else:
                 if not request.include_reasoning:
+                    reasoning_ended = True
+                elif request._grammar_from_tool_parser:
+                    # The Mistral grammar already includes an optional
+                    # `think?` rule that handles both reasoning and
+                    # non-reasoning outputs.
                     reasoning_ended = True
                 elif reasoning_parser:
                     reasoning_ended = reasoning_parser.is_reasoning_end(
@@ -530,6 +630,8 @@ class OpenAIServingChat(OpenAIServing):
             harmony_tools_streamed = [False] * num_choices
         tools_streamed = [False] * num_choices
 
+        is_mistral_grammar_path = request._grammar_from_tool_parser
+
         if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
             tool_choice_function_name = request.tool_choice.function.name
         else:
@@ -541,7 +643,25 @@ class OpenAIServingChat(OpenAIServing):
             and self._should_stream_with_auto_tool_parsing(request)
         )
 
+        # Determine whether required/named tool_choice should fall back to
+        # the auto tool_parser path instead of the standard JSON-based parsing.
+        # This happens when the parser declares supports_required_and_named=False
+        # (e.g. GLM models that output XML instead of JSON).
+        tool_choice_uses_parser = (
+            self.tool_parser is not None
+            and not self.tool_parser.supports_required_and_named
+            and request.tools
+            and (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
+            )
+        )
+
         all_previous_token_ids: list[list[int]] | None
+        # Track accumulated reasoning for fallback copy to content
+        accumulated_reasoning_arr: list[str] = [""] * num_choices
+        # Track if any content has been streamed
+        seen_content_arr: list[bool] = [False] * num_choices
         function_name_returned = [False] * num_choices
         if self.tool_call_id_type == "kimi_k2":
             history_tool_call_cnt = get_history_tool_calls_cnt(conversation)
@@ -553,13 +673,20 @@ class OpenAIServingChat(OpenAIServing):
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
-        if tool_choice_auto or reasoning_parser:
+        if (
+            is_mistral_grammar_path
+            or tool_choice_auto
+            or tool_choice_uses_parser
+            or reasoning_parser
+        ):
             # These are only required in "auto" tool choice case
             all_previous_token_ids = [[] for _ in range(num_choices)]
             reasoning_end_arr = [False] * num_choices
             prompt_is_reasoning_end_arr: list[bool | None] = [None] * num_choices
         else:
             all_previous_token_ids = None
+            accumulated_reasoning_arr = None
+            seen_content_arr = None
 
         try:
             if self.parser_cls is not None:
@@ -748,7 +875,12 @@ class OpenAIServingChat(OpenAIServing):
                     delta_message: DeltaMessage | None
 
                     # just update previous_texts and previous_token_ids
-                    if tool_choice_auto or reasoning_parser:
+                    if (
+                        is_mistral_grammar_path
+                        or tool_choice_auto
+                        or tool_choice_uses_parser
+                        or reasoning_parser
+                    ):
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
                         previous_text = previous_texts[i]
@@ -772,8 +904,34 @@ class OpenAIServingChat(OpenAIServing):
                             )
                         )
                         harmony_tools_streamed[i] |= tools_streamed_flag
+                    # Mistral grammar path: combined reasoning + tool streaming
+                    elif is_mistral_grammar_path:
+                        assert tool_parser is not None
+                        assert isinstance(tool_parser, MistralToolParser)
+                        assert reasoning_end_arr is not None
+                        output_token_ids = as_list(output.token_ids)
+                        result = tool_parser.extract_maybe_reasoning_and_tool_streaming(
+                            reasoning_parser=reasoning_parser,
+                            previous_text=previous_text,
+                            current_text=current_text,
+                            delta_text=delta_text,
+                            previous_token_ids=previous_token_ids,
+                            current_token_ids=current_token_ids,
+                            output_token_ids=output_token_ids,
+                            reasoning_ended=reasoning_end_arr[i],
+                            prompt_is_reasoning_end=(prompt_is_reasoning_end_arr[i]),
+                            request=request,
+                        )
+                        delta_message = result.delta_message
+                        reasoning_end_arr[i] = result.reasoning_ended
+                        current_text = result.current_text
+                        current_token_ids = result.current_token_ids
+                        if result.tools_called:
+                            tools_streamed[i] = True
                     # handle streaming deltas for tools with named tool_choice
-                    elif tool_choice_function_name:
+                    # Skip when tool_choice_uses_parser so it falls through
+                    # to the auto tool_parser branches below.
+                    elif tool_choice_function_name and not tool_choice_uses_parser:
                         # When encountering think end id in prompt_token_ids
                         # i.e {"enable_thinking": False},
                         # check BEFORE calling the parser to avoid a spurious
@@ -811,7 +969,6 @@ class OpenAIServingChat(OpenAIServing):
                             ):
                                 reasoning_end_arr[i] = True
                                 if delta_message and delta_message.content:
-                                    # This need to be added to next `delta_text`
                                     current_text = delta_message.content
                                     delta_message.content = None
                                 else:
@@ -856,7 +1013,12 @@ class OpenAIServingChat(OpenAIServing):
                             )
                             tools_streamed[i] = True
 
-                    elif request.tool_choice == "required":
+                    # Skip when tool_choice_uses_parser so it falls through
+                    # to the auto tool_parser branches below.
+                    elif (
+                        request.tool_choice == "required"
+                        and not tool_choice_uses_parser
+                    ):
                         assert previous_texts is not None
                         previous_text = previous_texts[i]
                         current_text = previous_text + delta_text
@@ -920,12 +1082,41 @@ class OpenAIServingChat(OpenAIServing):
                         )
                         if delta_message and delta_message.tool_calls:
                             tools_streamed[i] = True
+                        # Check if reasoning has ended
+                        if (
+                            reasoning_parser
+                            and not reasoning_end_arr[i]
+                            and reasoning_parser.is_reasoning_end(
+                                as_list(output.token_ids)
+                            )
+                        ):
+                            reasoning_end_arr[i] = True
+                            if delta_message and delta_message.content:
+                                seen_content_arr[i] = True
+
+                        # After reasoning ends, convert reasoning delta to content
+                        if (
+                            reasoning_end_arr[i]
+                            and delta_message
+                            and delta_message.reasoning
+                            and not delta_message.content
+                        ):
+                            delta_message.content = delta_message.reasoning
+                            delta_message.reasoning = None
+                            if seen_content_arr is not None:
+                                seen_content_arr[i] = True
+
                     # handle streaming just a content delta (no parsers)
                     else:
                         delta_message = DeltaMessage(content=delta_text)
 
                     # update the previous values for the next iteration
-                    if (tool_choice_auto or reasoning_parser) and not self.use_harmony:
+                    if (
+                        is_mistral_grammar_path
+                        or tool_choice_auto
+                        or tool_choice_uses_parser
+                        or reasoning_parser
+                    ) and not self.use_harmony:
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
                         previous_texts[i] = current_text
@@ -942,6 +1133,133 @@ class OpenAIServingChat(OpenAIServing):
                     # "control token" for tool calls or the parser otherwise
                     # wasn't ready to send a token, then
                     #   get the next token without streaming a chunk
+                    # Track reasoning and content for fallback copy
+                    if reasoning_parser and delta_message is not None:
+                        if (
+                            accumulated_reasoning_arr is not None
+                            and delta_message.reasoning
+                        ):
+                            accumulated_reasoning_arr[i] += delta_message.reasoning
+
+                            # Detect hallucinated tool-call patterns in reasoning
+                            if (
+                                not reasoning_end_arr[i]
+                                and tool_choice_auto
+                                and _detect_hallucinated_tool_calls_in_reasoning(
+                                    accumulated_reasoning_arr[i]
+                                )
+                            ):
+                                raise MalformedToolCallError(
+                                    "Model produced degenerate output: "
+                                    "repeated hallucinated tool-call "
+                                    "patterns detected in reasoning "
+                                    "content without closing the think "
+                                    "block. The model is likely stuck in "
+                                    "a loop generating malformed tool "
+                                    "call text."
+                                )
+
+                            # Detect Anthropic-style hallucinated tool calls
+                            anthropic_tool = _detect_anthropic_tool_pattern(
+                                delta_message.reasoning
+                            )
+                            if anthropic_tool:
+                                logger.error(
+                                    "Anthropic-style tool call in "
+                                    "reasoning for request %s: %r",
+                                    request_id,
+                                    anthropic_tool,
+                                )
+                                raise MalformedToolCallError(
+                                    f"Model produced degenerate output: "
+                                    f"Anthropic-style tool call pattern "
+                                    f"{anthropic_tool!r} detected in "
+                                    f"reasoning. The model is "
+                                    f"hallucinating tool calls in a "
+                                    f"foreign format."
+                                )
+
+                            # Detect special tokens leaked into reasoning
+                            leaked_token = _detect_special_tokens_in_text(
+                                delta_message.reasoning
+                            )
+                            if leaked_token:
+                                logger.error(
+                                    "Degenerate reasoning for request %s:\n"
+                                    "  leaked_token=%r\n"
+                                    "  delta_message.reasoning=%r\n"
+                                    "  reasoning_end=%s\n"
+                                    "  tool_choice_auto=%s",
+                                    request_id,
+                                    leaked_token,
+                                    delta_message.reasoning,
+                                    reasoning_end_arr[i],
+                                    tool_choice_auto,
+                                )
+                                raise MalformedReasoningError(
+                                    f"Model produced degenerate output: "
+                                    f"special token {leaked_token!r} "
+                                    f"detected in reasoning content. "
+                                    f"This indicates the model is "
+                                    f"generating malformed output with "
+                                    f"leaked control tokens."
+                                )
+
+                        if seen_content_arr is not None and delta_message.content:
+                            seen_content_arr[i] = True
+
+                        # Detect special tokens or leaked reasoning in content
+                        if delta_message.content:
+                            leaked_token = _detect_special_tokens_in_text(
+                                delta_message.content
+                            )
+                            if leaked_token:
+                                logger.error(
+                                    "Degenerate content for request %s:\n"
+                                    "  leaked_token=%r\n"
+                                    "  delta_message.content=%r\n"
+                                    "  reasoning_end=%s\n"
+                                    "  tool_choice_auto=%s",
+                                    request_id,
+                                    leaked_token,
+                                    delta_message.content,
+                                    reasoning_end_arr[i],
+                                    tool_choice_auto,
+                                )
+                                raise MalformedReasoningError(
+                                    f"Model produced degenerate output: "
+                                    f"special token {leaked_token!r} "
+                                    f"detected in content. This indicates "
+                                    f"the model is generating malformed "
+                                    f"output with leaked control tokens."
+                                )
+                            if _LEAKED_REASONING_MARKER in delta_message.content:
+                                raise MalformedReasoningError(
+                                    "Model produced degenerate output: "
+                                    "reasoning artifact detected in "
+                                    "content. This indicates the model "
+                                    "leaked its internal reasoning "
+                                    "structure into the response."
+                                )
+                            anthropic_tool = _detect_anthropic_tool_pattern(
+                                delta_message.content
+                            )
+                            if anthropic_tool:
+                                logger.error(
+                                    "Anthropic-style tool call in "
+                                    "content for request %s: %r",
+                                    request_id,
+                                    anthropic_tool,
+                                )
+                                raise MalformedToolCallError(
+                                    f"Model produced degenerate output: "
+                                    f"Anthropic-style tool call pattern "
+                                    f"{anthropic_tool!r} detected in "
+                                    f"content. The model is "
+                                    f"hallucinating tool calls in a "
+                                    f"foreign format."
+                                )
+
                     if delta_message is None:
                         # NOTE: If return_token_ids is enabled, we still need to
                         # send a chunk with token_ids even if delta_message is None
@@ -1005,6 +1323,24 @@ class OpenAIServingChat(OpenAIServing):
                         #   any tokens that were generated but previously
                         #   matched by partial json parsing
                         # only happens if we are NOT using structured outputs
+                        # If no content was ever sent, no tools were called,
+                        # and we have accumulated reasoning, set content to
+                        # reasoning for the final chunk.
+                        if (
+                            reasoning_parser
+                            and accumulated_reasoning_arr is not None
+                            and seen_content_arr is not None
+                            and not seen_content_arr[i]
+                            and not tools_streamed[i]
+                            and not (self.use_harmony and harmony_tools_streamed[i])
+                            and not auto_tools_called
+                            and accumulated_reasoning_arr[i]
+                        ):
+                            if delta_message is None:
+                                delta_message = DeltaMessage()
+                            delta_message.content = accumulated_reasoning_arr[i]
+                            seen_content_arr[i] = True
+
                         index = 0
                         auto_tools_called = False
                         if tool_parser:
@@ -1171,6 +1507,30 @@ class OpenAIServingChat(OpenAIServing):
                         delta=False,
                     )
 
+        except MalformedToolCallError as e:
+            logger.error(
+                "Malformed tool call detected for request %s: %s",
+                request_id,
+                str(e),
+            )
+            data = self.create_streaming_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            yield f"data: {data}\n\n"
+        except MalformedReasoningError as e:
+            logger.error(
+                "Malformed reasoning detected for request %s: %s",
+                request_id,
+                str(e),
+            )
+            data = self.create_streaming_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            yield f"data: {data}\n\n"
         except GenerationError as e:
             yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
         except Exception as e:
@@ -1295,6 +1655,77 @@ class OpenAIServingChat(OpenAIServing):
                 )
                 if not request.include_reasoning:
                     reasoning = None
+
+            # Detect hallucinated tool-call patterns in reasoning content.
+            if (
+                not content
+                and reasoning
+                and self.tool_parser
+                and self.enable_auto_tools
+                and _detect_hallucinated_tool_calls_in_reasoning(reasoning)
+            ):
+                logger.error(
+                    "Malformed tool call detected for request %s: "
+                    "repeated hallucinated tool-call patterns found in "
+                    "reasoning content without closing the think block.",
+                    request_id,
+                )
+                return self.create_error_response(
+                    "Model produced degenerate output: repeated "
+                    "hallucinated tool-call patterns detected in "
+                    "reasoning content without closing the think "
+                    "block. The model is likely stuck in a loop "
+                    "generating malformed tool call text.",
+                    err_type="InternalServerError",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+
+            # Detect Anthropic-style hallucinated tool calls in reasoning.
+            if reasoning:
+                anthropic_tool = _detect_anthropic_tool_pattern(reasoning)
+                if anthropic_tool:
+                    logger.error(
+                        "Anthropic-style tool call detected for "
+                        "request %s: %r in reasoning.",
+                        request_id,
+                        anthropic_tool,
+                    )
+                    return self.create_error_response(
+                        f"Model produced degenerate output: "
+                        f"Anthropic-style tool call pattern "
+                        f"{anthropic_tool!r} detected in reasoning.",
+                        err_type="InternalServerError",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+
+            # Detect special tokens leaked into reasoning.
+            if reasoning:
+                leaked_token = _detect_special_tokens_in_text(reasoning)
+                if leaked_token:
+                    logger.error(
+                        "Special token leak detected for request %s: "
+                        "token %r found in reasoning content.",
+                        request_id,
+                        leaked_token,
+                    )
+                    return self.create_error_response(
+                        f"Model produced degenerate output: special "
+                        f"token {leaked_token!r} detected in reasoning "
+                        f"content. This indicates the model is "
+                        f"generating malformed output with leaked "
+                        f"control tokens.",
+                        err_type="InternalServerError",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+
+            # Copy reasoning to content if content is empty and no tool calls.
+            if (
+                not content
+                and reasoning
+                and not tool_calls
+            ):
+                content = reasoning
+
             else:
                 reasoning = None
                 content = output.text
@@ -1312,7 +1743,24 @@ class OpenAIServingChat(OpenAIServing):
             tool_call_class = (
                 MistralToolCall if is_mistral_tokenizer(tokenizer) else ToolCall
             )
-            if (not self.enable_auto_tools or not self.tool_parser) and (
+
+            use_mistral_tool_parser = request._grammar_from_tool_parser
+            if use_mistral_tool_parser:
+                tool_call_items = MistralToolParser.build_non_streaming_tool_calls(
+                    tool_calls
+                )
+                if tool_call_items:
+                    auto_tools_called = (
+                        request.tool_choice is None or request.tool_choice == "auto"
+                    )
+                message = ChatMessage(
+                    role=role,
+                    reasoning=reasoning,
+                    content=content,
+                    tool_calls=tool_call_items,
+                )
+
+            elif (not self.enable_auto_tools or not self.tool_parser) and (
                 not isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
                 and request.tool_choice != "required"
             ):
