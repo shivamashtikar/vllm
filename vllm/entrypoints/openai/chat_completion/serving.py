@@ -1759,6 +1759,8 @@ class OpenAIServingChat(OpenAIServing):
             # check for error finish reason and raise GenerationError
             # finish_reason='error' indicates a retryable request-level internal error
             self._raise_if_error(output.finish_reason, request_id)
+            logger.info("[raw-response] request_id=%s output.text=%s",
+                        request_id, repr(output.text))
             token_ids = output.token_ids
             out_logprobs = output.logprobs
             tool_call_info = None
